@@ -169,6 +169,13 @@ fn stream_inner(gw: &Gateway, body: &Value, _ip: &str, rid: u64, sink: &mut dyn 
         }
         add_context(&mut messages, &context);
     }
+    if let Some(m) = &gw.media {
+        if m.comfy.busy.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            sink.event(&json!({"cubic_status": "Your PC is busy making something, so this reply will be slower…"}))?;
+        }
+        // ComfyUI may still hold the GPU from a picture just made.
+        m.comfy.free_for_chat();
+    }
     let payload = ollama_request(body, model, messages, &info, info.context(gw.settings.num_ctx(gw.config.default_ctx)), gw.settings.keep_alive());
     gw.activity.phase(rid, "Waiting for model");
     let mut r = gw.ollama.post("/api/chat", &payload, true).map_err(|e| Fail::Message(format!("Ollama: {e}")))?;

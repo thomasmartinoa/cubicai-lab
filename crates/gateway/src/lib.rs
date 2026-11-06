@@ -13,11 +13,14 @@ pub mod activity;
 pub mod chat;
 pub mod http;
 pub mod identity;
+pub mod jobs;
+pub mod media;
 pub mod ollama;
 pub mod search;
 pub mod server;
 pub mod settings;
 pub mod time;
+pub mod workflow;
 
 use std::path::PathBuf;
 
@@ -39,6 +42,8 @@ pub struct Config {
     pub searxng: String,
     /// The context a request gets when neither the Modelfile nor settings.json sets one.
     pub default_ctx: u64,
+    /// Making things with ComfyUI (None: the phone is told there's nothing to make).
+    pub media: Option<media::Paths>,
 }
 
 impl Config {
@@ -50,6 +55,7 @@ impl Config {
             ollama: std::env::var("CUBICAI_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
             searxng: std::env::var("CUBICAI_SEARXNG_URL").unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
             default_ctx: std::env::var("CUBICAI_NUM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384),
+            media: Some(media::Paths::from_env()),
         }
     }
 }

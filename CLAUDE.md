@@ -1,6 +1,6 @@
 # CubicAI Lab: desktop companion to the CubicAI Android app
 
-Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gateway` (cubic-gateway, the phone's PC gateway) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (done; verified live), 6 the phone's gateway rewritten in Rust (the user's choice over keeping Python): 6a core (done), 6b ComfyUI media, 6c voice calls, 6d the Lab as its panel + switch-over.
+Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gateway` (cubic-gateway, the phone's PC gateway) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (done; verified live), 6 the phone's gateway rewritten in Rust (the user's choice over keeping Python): 6a core (done), 6b ComfyUI media (done; verified live), 6c voice calls, 6d the Lab as its panel + switch-over.
 
 ## Build / check
 - `cargo build --release`; `cargo clippy --workspace --all-targets` should stay clean.
@@ -8,7 +8,7 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gatewa
   - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] cargo test --release shots -- --nocapture`
   - Read the PNGs rather than opening windows on the desktop.
 - Tests:
-  - `cargo test --workspace --release` runs about 135 offline tests in roughly a second, and must stay green.
+  - `cargo test --workspace --release` runs about 138 offline tests in roughly a second, and must stay green.
   - Test helpers live in `app/src/tests/mod.rs`: `tiny_model` (a GGUF built with `cubic_gguf::Writer`), `TempDir` and `mock_http`.
   - Decoder fixtures come from gguf-py (`crates/gguf/tests/fixtures/make.py`).
   - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth; the user has allowed me to run them. `net_real_train` (Llama 3.1 8B, RTX 3070 Ti 8 GB): 18 steps in 44 s, loss 3.72 -> 0.13, base "The capital of Japan is Tokyo." vs tuned "Ahoy! Tokyo is the capital of Japan.". The Fine-tune shots replay that run (`AHOY_FACTS`, `REAL_LOSSES` in shots.rs).
@@ -116,8 +116,10 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gatewa
 - Rules kept from Python: drop disallowed peers before TLS and 403 per request; 64 slots, 12 per address; 1 s sleep + 401 on a bad token; error replies drain the body (≤1 MiB) and close; chat replies are SSE with `Connection: close`; Ollama tool-call arguments are re-encoded like Python's json.dumps (`python_dumps`).
 - Page fetching for search is guarded by `search::PublicOnly`, a ureq resolver that refuses unless every resolved address is public (`access::is_global`); ureq connects only to those addresses and resolves each redirect again, proxies off.
 - The long Ollama agent limits only connect (10 s) and time to first byte (900 s), not the whole stream. Model info is cached only when /api/show succeeded (Python also cached failures).
-- Not ported yet: media routes answer "isn't in this gateway yet" (generators empty), voice reports not ready. So the systemd service stays on Python until 6b/6c.
-- Tests: `tests/units.rs` (rules, against Python's own outputs), `tests/e2e.rs` (real TLS client pinning the fingerprint, fake Ollama/SearXNG: search, keep-alive, slots, hang-up stops Ollama). `real_matches_python` (ignored) runs beside the live Python gateway on 8443 with the same identity: model lists identical, same event stream, live search (8 sources, ~13 s).
+- Media (6b): `workflow.rs` (comfy_workflow.py: UI workflow → API prompt), `media.rs` (the 13 `GENERATORS`, prompt building, the generator list with the workflow's own defaults, saving on the PC), `jobs.rs` (`Comfy`: the `cubicai-comfyui` unit started on demand with reset-failed + a second try, stopped after `CUBICAI_COMFY_IDLE` if we started it, `/free` + `free_ollama(partial_only)` before a chat; `Jobs`: one worker, a Condvar per job for the event streams, `preview_seq` so a preview is sent once, a janitor that empties our ComfyUI's history when idle and deletes results not collected within the hour; our own small WebSocket client for ComfyUI's progress and previews). Starting the media manager clears ComfyUI's `cubicai/` folders, the temp folder and our unit's queue, so it must not start beside the running Python gateway (`Config.media: None` in `real_matches_python`).
+- Python quirks kept: `round()` is banker's rounding (`round_ties_even`), seeds are taken modulo the node's max+1 in u128 (KSampler's max is 2^64−1), serde_json has `preserve_order` (object_info order decides widget order; also Python's key order in events).
+- Not ported yet: voice reports not ready. So the systemd service stays on Python until 6c.
+- Tests: `tests/units.rs` (rules, against Python's own outputs), `tests/e2e.rs` (real TLS client pinning the fingerprint, fake Ollama/SearXNG: search, keep-alive, slots, hang-up stops Ollama). `real_matches_python` (ignored) runs beside the live Python gateway on 8443 with the same identity: model lists identical, same event stream, live search (8 sources, ~13 s). `tests/media.rs`: a fake ComfyUI (HTTP + WebSocket with pings, fragments, a binary preview, an `../etc` path in its history) driving a job end to end, errors, cancel, expiry and saving; `real_comfy_makes_a_picture` (ignored) makes a FLUX.2 Klein picture on the real ComfyUI (~13 s with a cold start) in its own cache folder and stops the unit again if it was off. `tests/golden.rs` (ignored) runs `tests/golden/media_golden.py` against the real Python modules: converter on all 21 saved workflows, every generator's built prompt, sizes and the list match exactly.
 
 ## Data
 - Paths come from `directories` (`dev/martin/cubicai-lab`).

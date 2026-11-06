@@ -1,13 +1,13 @@
 //! The gateway end to end, the way the phone uses it: TLS 1.3 to a pinned certificate, the token,
 //! keep-alive, a streamed chat with web search. Ollama and SearXNG are a fake on this PC.
 
+mod common;
+
+use common::*;
 use cubic_gateway::http::Conn;
 use cubic_gateway::{identity, server, Config};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,125 +92,6 @@ fn backend_conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
     }
 }
 
-// --- A client like the phone: TLS 1.3, pinned by fingerprint ----------------------------------------
-
-#[derive(Debug)]
-struct Pin(String, Arc<rustls::crypto::CryptoProvider>);
-
-impl ServerCertVerifier for Pin {
-    fn verify_server_cert(&self, cert: &CertificateDer, _: &[CertificateDer], _: &ServerName, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-        if identity::fingerprint(cert) == self.0 { Ok(ServerCertVerified::assertion()) } else { Err(rustls::Error::General("not our PC".into())) }
-    }
-
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.1.signature_verification_algorithms)
-    }
-
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.1.signature_verification_algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.1.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-type Client = BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
-
-fn connect_with(port: u16, pin: &str, version: &'static rustls::SupportedProtocolVersion) -> std::io::Result<Client> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[version])
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Pin(pin.to_string(), provider)))
-        .with_no_client_auth();
-    let conn = rustls::ClientConnection::new(Arc::new(cfg), ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into())).unwrap();
-    let tcp = TcpStream::connect(("127.0.0.1", port))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut s = rustls::StreamOwned::new(conn, tcp);
-    while s.conn.is_handshaking() {
-        s.conn.complete_io(&mut s.sock)?;
-    }
-    Ok(BufReader::new(s))
-}
-
-fn connect(port: u16, pin: &str) -> Client {
-    connect_with(port, pin, &rustls::version::TLS13).expect("TLS 1.3 to the pinned certificate")
-}
-
-fn send(c: &mut Client, method: &str, path: &str, token: Option<&str>, body: Option<&str>) {
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: pc\r\n");
-    if let Some(t) = token {
-        req += &format!("Authorization: Bearer {t}\r\n");
-    }
-    if let Some(b) = body {
-        req += &format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len());
-    }
-    req += "\r\n";
-    req += body.unwrap_or("");
-    c.get_mut().write_all(req.as_bytes()).unwrap();
-    c.get_mut().flush().unwrap();
-}
-
-struct Resp {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: String,
-}
-
-impl Resp {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).unwrap_or(Value::Null)
-    }
-
-    fn header(&self, k: &str) -> Option<&str> {
-        self.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str())
-    }
-
-    /// The `data:` events of a stream.
-    fn events(&self) -> Vec<String> {
-        self.body.split("\n\n").filter_map(|e| e.strip_prefix("data: ")).map(String::from).collect()
-    }
-}
-
-fn read_resp(c: &mut Client) -> Resp {
-    let mut line = String::new();
-    c.read_line(&mut line).unwrap();
-    let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mut headers = vec![];
-    loop {
-        let mut h = String::new();
-        c.read_line(&mut h).unwrap();
-        let h = h.trim_end();
-        if h.is_empty() {
-            break;
-        }
-        let (k, v) = h.split_once(':').unwrap();
-        headers.push((k.trim().to_string(), v.trim().to_string()));
-    }
-    let len = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length")).map(|(_, v)| v.parse::<usize>().unwrap());
-    let body = match len {
-        Some(n) => {
-            let mut b = vec![0; n];
-            c.read_exact(&mut b).unwrap();
-            String::from_utf8(b).unwrap()
-        }
-        None => {
-            let mut b = String::new();
-            let _ = c.read_to_string(&mut b);
-            b
-        }
-    };
-    Resp { status, headers, body }
-}
-
-fn ask(port: u16, pin: &str, method: &str, path: &str, token: Option<&str>, body: Option<&str>) -> Resp {
-    let mut c = connect(port, pin);
-    send(&mut c, method, path, token, body);
-    read_resp(&mut c)
-}
-
 // --- The gateway ----------------------------------------------------------------------------------
 
 struct Setup {
@@ -231,7 +112,7 @@ fn setup(name: &str) -> Setup {
     let dir = std::env::temp_dir().join(format!("cubic-gw-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (backend, seen) = fake_backend();
-    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384 };
+    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384, media: None };
     let id = identity::load(&dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, seen, dir }
@@ -315,6 +196,7 @@ fn models_for_the_phone() {
 
 #[test]
 fn a_chat_with_web_search_streams_like_the_python_gateway() {
+    // Keys in the Python gateway's order too (serde_json preserve_order).
     let s = setup("chat");
     let body = json!({
         "model": "gemma4:e4b",
@@ -336,9 +218,9 @@ fn a_chat_with_web_search_streams_like_the_python_gateway() {
         r#"{"cubic_status":"Searching: rust gateway news"}"#,
         r#"{"citations":["http://127.0.0.1:1/page"]}"#,
         r#"{"cubic_status":"Reading 1 results…"}"#,
-        r#"{"choices":[{"delta":{"reasoning":"Let me look."},"index":0}]}"#,
-        r#"{"choices":[{"delta":{"content":"Here's the news [1]."},"index":0}]}"#,
-        r#"{"choices":[],"usage":{"completion_tokens":12,"prompt_tokens":900}}"#,
+        r#"{"choices":[{"index":0,"delta":{"reasoning":"Let me look."}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"Here's the news [1]."}}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":12}}"#,
         "[DONE]",
     ];
     assert_eq!(ev, want);
@@ -411,7 +293,9 @@ fn twelve_connections_per_address() {
 #[test]
 #[ignore]
 fn real_matches_python() {
-    let config = Config::from_env();
+    // No media here: starting the media manager clears ComfyUI's cubicai folders and the temp
+    // folder, which the running Python gateway shares (its undelivered results live there).
+    let config = Config { media: None, ..Config::from_env() };
     let id = identity::load(&config.dir).expect("the Python gateway's identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let (rust, python) = (gw.port, 8443);

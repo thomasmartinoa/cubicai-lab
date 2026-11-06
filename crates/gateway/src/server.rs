@@ -23,9 +23,10 @@ pub struct Gateway {
     pub fingerprint: String,
     pub port: u16,
     pub settings: Settings,
-    pub activity: Activity,
+    pub activity: Arc<Activity>,
     pub ollama: Ollama,
     pub host: Host,
+    pub media: Option<Arc<crate::jobs::Jobs>>,
     vram: OnceLock<Option<u64>>,
     slots: Mutex<(usize, HashMap<IpAddr, usize>)>,
 }
@@ -33,13 +34,14 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(config: Config, id: &Identity, port: u16) -> Gateway {
         Gateway {
+            media: config.media.clone().map(|p| crate::jobs::Jobs::new(p, &config.ollama)),
             settings: Settings::new(&config.dir),
             ollama: Ollama::new(&config.ollama),
             config,
             token: id.token.clone(),
             fingerprint: id.fingerprint.clone(),
             port,
-            activity: Activity::default(),
+            activity: Arc::new(Activity::default()),
             host: Host::default(),
             vram: OnceLock::new(),
             slots: Mutex::new((0, HashMap::new())),
@@ -228,7 +230,7 @@ fn connection(gw: &Gateway, tls: Arc<rustls::ServerConfig>, tcp: TcpStream, ip: 
     }
 }
 
-const NOT_YET_MEDIA: &str = "Making things on the PC isn't in this gateway yet.";
+const NO_MEDIA: &str = "Making things isn't set up on this PC.";
 const NOT_YET_VOICE: &str = "voice support in this gateway";
 
 /// One request. Returns whether the connection may carry another.
@@ -250,13 +252,22 @@ pub fn handle<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req:
             "/health" | "/v1/health" => conn.json(req, 200, &json!({"ok": true})),
             "/v1/cubicai/status" => conn.json(req, 200, &gw.activity.snapshot()),
             "/v1/models" => models(gw, conn, req),
-            "/v1/media/generators" => conn.json(req, 200, &json!({"generators": [], "comfy_running": false})),
-            p if p.starts_with("/v1/media/") => conn.json(req, 404, &error("This result is no longer on your PC.")),
+            "/v1/media/generators" => match &gw.media {
+                Some(m) => conn.json(req, 200, &json!({"generators": m.catalog.list(m.comfy.known_info().as_ref()), "comfy_running": m.comfy.running()})),
+                None => conn.json(req, 200, &json!({"generators": [], "comfy_running": false})),
+            },
+            p if p.starts_with("/v1/media/") => media_get(gw, conn, req, p),
             "/v1/voice/voices" => conn.json(req, 200, &json!({"ready": false, "missing": NOT_YET_VOICE, "voices": []})),
             "/v1/voice/call" | "/v1/voice/preview" => conn.json(req, 503, &error(&format!("Voice calls need {NOT_YET_VOICE} on your PC."))),
             _ => conn.json(req, 404, &error("Not found")),
         },
-        "DELETE" => conn.json(req, 404, &error("No such job")),
+        "DELETE" => {
+            let id = path.strip_prefix("/v1/media/jobs/").filter(|id| is_job_id(id));
+            match (&gw.media, id) {
+                (Some(m), Some(id)) if m.cancel(id) => conn.json(req, 200, &json!({"ok": true})),
+                _ => conn.json(req, 404, &error("No such job")),
+            }
+        }
         "POST" => post(gw, conn, req, &path, ip),
         _ => conn.json(req, 404, &error("Not found")),
     }
@@ -276,7 +287,7 @@ fn models<S: Read + Write>(gw: &Gateway, conn: &mut Conn<S>, req: &Request) -> i
 
 fn post<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, path: &str, ip: IpAddr) -> io::Result<bool> {
     if path == "/v1/media/save" {
-        return conn.json(req, 503, &error(NOT_YET_MEDIA));
+        return media_save(gw, conn, req, ip);
     }
     if path != "/v1/chat/completions" && path != "/v1/media/jobs" {
         return conn.json(req, 404, &error("Not found"));
@@ -291,7 +302,7 @@ fn post<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Requ
     let raw = conn.read_body(len)?;
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else { return conn.json(req, 400, &error("Invalid JSON")) };
     if path == "/v1/media/jobs" {
-        return conn.json(req, 503, &error(NOT_YET_MEDIA));
+        return media_submit(gw, conn, req, &body, ip);
     }
     // Authorised: allow long generations.
     conn.stream().set_timeout(900);
@@ -306,6 +317,135 @@ fn post<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Requ
     let o = crate::chat::stream(gw, &body, &ip.to_string(), rid, conn);
     gw.activity.end(rid, o.outcome, o.tokens, o.gen_seconds);
     Ok(false)
+}
+
+fn is_job_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn media_submit<S: Read + Write>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, body: &Value, ip: IpAddr) -> io::Result<bool> {
+    let Some(m) = &gw.media else { return conn.json(req, 503, &error(NO_MEDIA)) };
+    let decode = |field: &str| -> Result<Option<Vec<u8>>, String> {
+        match body[field].as_str().filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(b) => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b.trim()).map(Some).map_err(|e| format!("Invalid base64 in {field}: {e}")),
+        }
+    };
+    let submitted = decode("image").and_then(|image| {
+        let audio = decode("audio")?;
+        m.submit(body["generator"].as_str().unwrap_or(""), body.clone(), image, audio, &ip.to_string())
+    });
+    let job = match submitted {
+        Ok(j) => j,
+        Err(e) => return conn.json(req, 400, &error(&e)),
+    };
+    let rid = gw.activity.begin(&ip.to_string(), job.spec["name"].as_str().unwrap_or(""), false);
+    // The activity list follows the job. A Weak keeps the gateway from owning itself through it.
+    let act = Arc::downgrade(&gw.activity);
+    *job.on_change.lock().unwrap() = Some(Box::new(move |state, phase| {
+        let Some(a) = act.upgrade() else { return };
+        if crate::jobs::TERMINAL.contains(&state) {
+            a.end(rid, if state == "done" { "ok" } else { state }, 0, 0.0);
+        } else {
+            a.phase(rid, phase);
+        }
+    }));
+    conn.json(req, 200, &json!({"id": job.id}))
+}
+
+fn media_get<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, path: &str) -> io::Result<bool> {
+    let gone = |conn: &mut Conn<S>| conn.json(req, 404, &error("This result is no longer on your PC."));
+    let Some(m) = &gw.media else { return gone(conn) };
+    let Some(rest) = path.strip_prefix("/v1/media/jobs/") else { return gone(conn) };
+    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let job = if is_job_id(id) { m.get(id) } else { None };
+    let Some(job) = job else { return gone(conn) };
+    if tail.is_empty() {
+        return conn.json(req, 200, &job.snapshot(false));
+    }
+    if tail == "events" {
+        media_events(conn, &job);
+        return Ok(false);
+    }
+    match tail.strip_prefix("files/").and_then(|n| n.parse::<usize>().ok()) {
+        Some(index) => media_file(m, conn, req, &job, index),
+        None => gone(conn),
+    }
+}
+
+/// Server-sent progress until the job ends; the phone reconnects here if the network drops.
+fn media_events<S: Read + Write + Timeouts>(conn: &mut Conn<S>, job: &crate::jobs::Job) {
+    if conn.start_events().is_err() {
+        return;
+    }
+    conn.stream().set_timeout(60);
+    let mut seen: Option<u64> = None;
+    let mut sent_preview = 0u64;
+    loop {
+        let (snap, terminal) = {
+            let mut s = job.st.lock().unwrap();
+            if Some(s.version) == seen {
+                s = job.cond.wait_timeout(s, Duration::from_secs(15)).unwrap().0;
+            }
+            if Some(s.version) == seen {
+                (None, false)
+            } else {
+                seen = Some(s.version);
+                let fresh = s.preview.is_some() && s.preview_seq != sent_preview;
+                sent_preview = s.preview_seq;
+                (Some(crate::jobs::snapshot_of(job, &s, fresh)), crate::jobs::TERMINAL.contains(&s.state.as_str()))
+            }
+        };
+        let sent = match snap {
+            // Keeps NAT and Tailscale paths open.
+            None => conn.raw(b": still working\n\n"),
+            Some(v) => conn.event(&v),
+        };
+        if sent.is_err() || terminal {
+            return; // the phone went away (the job carries on and it can reconnect), or it's over
+        }
+    }
+}
+
+fn media_file<S: Read + Write + Timeouts>(m: &crate::jobs::Jobs, conn: &mut Conn<S>, req: &Request, job: &crate::jobs::Job, index: usize) -> io::Result<bool> {
+    let f = job.st.lock().unwrap().files.iter().find(|f| f.index == index).cloned();
+    let Some(f) = f.filter(|f| f.path.exists()) else { return conn.json(req, 404, &error("No such file")) };
+    let Ok(mut src) = std::fs::File::open(&f.path) else { return conn.json(req, 404, &error("No such file")) };
+    let size = src.metadata().map(|m| m.len()).unwrap_or(0);
+    conn.stream().set_timeout(120);
+    let head = format!("HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: {}\r\nContent-Length: {size}\r\n\r\n", f.mime);
+    let w = conn.stream();
+    let sent = w.write_all(head.as_bytes()).and_then(|_| io::copy(&mut src, w)).and_then(|_| w.flush());
+    if sent.is_err() {
+        return Ok(false); // not delivered: the phone can ask again
+    }
+    m.delivered(job, index);
+    Ok(!req.wants_close())
+}
+
+fn media_save<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, ip: IpAddr) -> io::Result<bool> {
+    let Some(m) = &gw.media else { return conn.json(req, 503, &error(NO_MEDIA)) };
+    let kind = req.query("kind").unwrap_or_default();
+    let name = req.query("name").unwrap_or_else(|| "cubicai".into());
+    let length = match req.content_length() {
+        Ok(n) => n.unwrap_or(0) as u64,
+        Err(e) => return conn.json(req, 400, &error(&e.to_string())),
+    };
+    conn.stream().set_timeout(120);
+    if !matches!(kind.as_str(), "image" | "video" | "audio") {
+        return conn.json(req, 400, &error("Unknown kind"));
+    }
+    if length == 0 || length > crate::media::MAX_SAVE {
+        return conn.json(req, 400, &error("File too large"));
+    }
+    conn.body_read = true;
+    match crate::media::save(&m.comfy.paths.save_dir, &kind, &name, &mut conn.r, length) {
+        Ok(path) => {
+            log(&format!("saved a {kind} from {ip}"));
+            conn.json(req, 200, &json!({"ok": true, "path": path}))
+        }
+        Err(e) => conn.json(req, 400, &error(&e)),
+    }
 }
 
 /// Announces the gateway on the home network through avahi, so a paired phone can find the PC again
