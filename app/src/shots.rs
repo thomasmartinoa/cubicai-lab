@@ -88,6 +88,62 @@ fn shots() {
             save(&mut h, "tensor");
         }
     }
+    // X-ray with a canned reply (layout only), a fork, and a selected token.
+    {
+        use crate::engine::xray::{BranchState, Candidate, Step, Tree};
+        let words: &[(&str, f32, &[(&str, f32)])] = &[
+            ("The", 0.82, &[(" A", 0.09), ("On", 0.04)]),
+            (" keeper", 0.64, &[(" old", 0.2), (" lighthouse", 0.1)]),
+            (" climbed", 0.31, &[(" counted", 0.22), (" watched", 0.18), (" lit", 0.12)]),
+            (" the", 0.97, &[(" his", 0.02)]),
+            (" spiral", 0.44, &[(" stairs", 0.3), (" narrow", 0.15)]),
+            (" stairs", 0.93, &[(" staircase", 0.05)]),
+            (" each", 0.52, &[(" every", 0.33), (" at", 0.08)]),
+            (" night", 0.9, &[(" evening", 0.07)]),
+            (",", 0.71, &[(" to", 0.2)]),
+            (" talking", 0.12, &[(" trimming", 0.3), (" polishing", 0.2), (" lighting", 0.18)]),
+            (" to", 0.95, &[(" with", 0.04)]),
+            (" the", 0.6, &[(" a", 0.2), (" his", 0.15)]),
+            (" gulls", 0.38, &[(" sea", 0.25), (" lamp", 0.2)]),
+            (".", 0.88, &[(" as", 0.05)]),
+        ];
+        let mut tree = Tree::new("<|user|>Write one sentence about a lighthouse keeper.<|assistant|>".into());
+        let mut id = 100;
+        let mut mk = |t: &str, p: f32| {
+            id += 1;
+            Candidate { id, bytes: t.as_bytes().to_vec(), p }
+        };
+        for (w, p, alts) in words {
+            let chosen = mk(w, *p);
+            let mut top = vec![chosen.clone()];
+            top.extend(alts.iter().map(|(t, q)| mk(t, *q)));
+            top.sort_by(|a, b| b.p.total_cmp(&a.p));
+            tree.branches[0].steps.push(Step { chosen, top });
+        }
+        tree.branches[0].state = BranchState::Done;
+        tree.branches[0].gen_tps = Some(96.0);
+        let alt = tree.branches[0].steps[9].top[0].clone();
+        let f = tree.fork(0, 9, alt);
+        for w in [" the", " wick", " until", " dawn", "."] {
+            let c = mk(w, 0.7);
+            tree.branches[f].steps.push(Step { chosen: c.clone(), top: vec![c] });
+        }
+        tree.branches[f].state = BranchState::Done;
+        let app = h.state_mut();
+        app.xray.tree = Some(tree);
+        app.xray.branch = 0;
+        app.tab = Tab::XRay;
+    }
+    settle(&mut h, 500, |_| false);
+    save(&mut h, "xray");
+    h.state_mut().xray.selected = Some(9);
+    settle(&mut h, 500, |_| false);
+    save(&mut h, "xray-token");
+    h.state_mut().xray.selected = None;
+    h.state_mut().xray.branch = 1;
+    settle(&mut h, 500, |_| false);
+    save(&mut h, "xray-fork");
+
     h.state_mut().tab = Tab::Settings;
     settle(&mut h, 500, |_| false);
     save(&mut h, "settings");
@@ -232,6 +288,42 @@ mod real {
         }
         println!("reasoning {thought} chars\nreply: {}", reply.trim());
         assert!(!reply.trim().is_empty());
+
+        // X-ray against the real server: template, probabilities per token, an exact-token fork.
+        use crate::engine::xray::{self, Sampling, Tree, XEv};
+        let root = xray::root_of(&s.base_url());
+        let prompt = xray::apply_template(&root, &[serde_json::json!({"role": "user", "content": "Name three colours."})]).expect("template");
+        println!("template: {:?}", prompt.chars().take(120).collect::<String>());
+        let mut tree = Tree::new(prompt);
+        let run = |tree: &mut Tree, b: usize| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let sm = Sampling { temperature: 0.0, max_tokens: 40, ..Default::default() };
+            xray::generate(root.clone(), tree.continuation(b), sm, b, tx, Default::default(), egui::Context::default());
+            loop {
+                match rx.recv_timeout(Duration::from_secs(120)).expect("x-ray event").1 {
+                    XEv::Steps(st) => tree.branches[b].steps.extend(st),
+                    XEv::Done { .. } => break,
+                    XEv::Error(e) => panic!("x-ray: {e}"),
+                }
+            }
+        };
+        run(&mut tree, 0);
+        let steps = &tree.branches[0].steps;
+        assert!(!steps.is_empty(), "no probabilities came back");
+        for st in steps {
+            assert!(st.chosen.p > 0.0 && st.chosen.p <= 1.0);
+            assert!(!st.top.is_empty() && st.top.len() <= xray::N_PROBS as usize);
+            assert!(st.top.iter().map(|c| c.p).sum::<f32>() <= 1.001);
+            assert_eq!(st.rank(), Some(0), "greedy takes the favourite");
+        }
+        println!("x-ray main: {:?}", tree.text(0));
+        let i = (0..steps.len()).max_by(|&a, &b| steps[a].entropy().total_cmp(&steps[b].entropy())).unwrap();
+        let alt = steps[i].top[1].clone();
+        println!("forking at token {i} ({:?}, {:.0}%) -> {:?} ({:.0}%)", steps[i].chosen.text(), steps[i].chosen.p * 100.0, alt.text(), alt.p * 100.0);
+        let f = tree.fork(0, i, alt);
+        run(&mut tree, f);
+        println!("x-ray fork: {:?}", tree.text(f));
+        assert_ne!(tree.text(f), tree.text(0));
         s.stop();
 
         let r = bench::run(&bin, "real", &model, &preset, 999, 0, "test", &Task::new("bench")).expect("bench");

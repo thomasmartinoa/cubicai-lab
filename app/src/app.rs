@@ -16,6 +16,7 @@ pub enum Tab {
     Chat,
     Engine,
     Anatomy,
+    XRay,
     Settings,
 }
 
@@ -69,6 +70,7 @@ pub struct App {
     pub gpu: GpuMonitor,
     pub engine_ui: ui::engine::EngineUi,
     pub anatomy: ui::anatomy::AnatomyUi,
+    pub xray: ui::xray::XrayUi,
     pub settings_ui: ui::settings::SettingsUi,
     applied_theme: Option<ThemeChoice>,
     pub toast: Option<(String, Instant)>,
@@ -104,6 +106,7 @@ impl App {
             gpu: GpuMonitor::new(),
             engine_ui: Default::default(),
             anatomy: Default::default(),
+            xray: Default::default(),
             settings_ui: Default::default(),
             tab: Tab::Chat,
             applied_theme: None,
@@ -404,6 +407,34 @@ impl App {
         }
     }
 
+    /// Opens the X-ray on a chat reply: the history before it is replayed on the local model.
+    pub fn xray_from_chat(&mut self, msg_id: &str) {
+        let Some(chat) = self.current_chat() else { return };
+        let mut messages = vec![];
+        let sys = self.system_prompt(&chat.persona_id);
+        if !sys.is_empty() {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
+        for m in chat.messages.iter().take_while(|m| m.id != msg_id) {
+            if m.role == "assistant" && (m.content.is_empty() || m.error.is_some()) {
+                continue;
+            }
+            messages.push(json!({"role": m.role, "content": m.content}));
+        }
+        if messages.last().is_none_or(|m| m["role"] != "user") {
+            self.notify("Nothing to replay before this reply");
+            return;
+        }
+        let title = chat.title.clone();
+        self.xray.load_chat(title, messages);
+        if let Some(k) = self.settings.models.get(providers::PC).cloned()
+            && self.settings.provider == providers::PC {
+                self.xray.model_key = Some(k);
+            }
+        self.xray.run_when_ready = self.server.state() == engine::server::State::Ready;
+        self.tab = Tab::XRay;
+    }
+
     /// Puts a user message back in the composer and drops it and everything after it.
     pub fn edit_message(&mut self, msg_id: &str) {
         if self.busy() {
@@ -521,6 +552,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.xray.stop();
         self.server.stop();
         self.save_settings();
     }

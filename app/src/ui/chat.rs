@@ -302,6 +302,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Action::Regenerate) => app.regenerate(ui.ctx()),
         Some(Action::Edit(id)) => app.edit_message(&id),
+        Some(Action::Xray(id)) => app.xray_from_chat(&id),
         None => {}
     }
 }
@@ -310,6 +311,7 @@ enum Action {
     Copy(String),
     Regenerate,
     Edit(String),
+    Xray(String),
 }
 
 fn user_message(ui: &mut egui::Ui, p: &crate::theme::Palette, m: &Message, action: &mut Option<Action>) {
@@ -407,6 +409,12 @@ fn assistant_message(app: &mut App, ui: &mut egui::Ui, p: &crate::theme::Palette
             }
             if last && ui.small_button(if m.error.is_some() { "Retry" } else { "Regenerate" }).clicked() {
                 *action = Some(Action::Regenerate);
+            }
+            if !m.content.is_empty()
+                && m.error.is_none()
+                && ui.small_button("X-ray").on_hover_text("Replay this reply on your GPU and see how each token was chosen").clicked()
+            {
+                *action = Some(Action::Xray(m.id.clone()));
             }
             if m.output_tokens > 0 {
                 widgets::hint(ui, format!("{} tokens", m.output_tokens));

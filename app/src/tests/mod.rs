@@ -3,6 +3,7 @@
 mod engine;
 mod llm;
 mod store;
+mod xray;
 
 use cubic_gguf::{GgmlType, Writer};
 use std::path::PathBuf;

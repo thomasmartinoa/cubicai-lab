@@ -24,6 +24,14 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 - Each tensor has a value histogram, a heat map of the whole matrix with its row and column profiles, and a zoom down to the individual numbers.
 - Decodes F32/F16/BF16, the Q4–Q8 legacy quants, K-quants, IQ4_NL/IQ4_XS, MXFP4 and TQ2_0. Each decoder was checked against gguf-py and matches exactly.
 
+**X-ray.** Watch a reply being written on your own GPU:
+- Every token is coloured by how sure the model was, or by how many close rivals it had. A strip across the top shows the whole reply at a glance.
+- Hover a token to see the alternatives it weighed.
+- Click a token to see its probability, rank and uncertainty in bits, plus a lens showing what your temperature, top-k, top-p and min-p settings do to that step.
+- Fork at any token: pick another candidate and the reply continues from there as a new branch. The fork is sent as exact token ids, so nothing is re-tokenised. Forks can be forked again, and every branch stays in a tree you can switch between.
+- "X-ray" on a chat reply replays that conversation under the X-ray.
+- Uses llama-server's `/completion` with `n_probs`.
+
 ![A tensor up close](docs/screenshots/tensor.png)
 
 ## Build
@@ -43,7 +51,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (68 tests, about a second).**
+**Offline (77 tests, about a second).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -60,12 +68,18 @@ cargo test --workspace --release
   - the phone's chat files read and written back unchanged;
   - settings fallbacks;
   - behaviours kept in sync with the phone's.
+- **X-ray:**
+  - the server's probability chunks (both shapes);
+  - uncertainty in bits;
+  - the sampler lens against hand-worked examples;
+  - branch trees with nested forks and exact-token continuation prompts;
+  - the screen's own run → fork → continue flow against a mock llama-server.
 
 **Live, run by hand (`--ignored`).**
 ```
 cargo test --release net_ -- --ignored --nocapture --skip net_real    # GitHub release + install, Hugging Face, Ollama stream
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
-  cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, benchmark
+  cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, X-ray + fork, benchmark
 SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   cargo test --release shots -- --nocapture                           # renders every screen offscreen to PNGs
 ```
