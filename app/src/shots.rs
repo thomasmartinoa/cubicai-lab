@@ -306,6 +306,51 @@ fn shots() {
     h.state_mut().tab = Tab::Settings;
     settle(&mut h, 500, |_| false);
     save(&mut h, "settings");
+
+    // The phone gateway's panel with sample data and a throwaway identity (no real token or device).
+    let pair_dir = std::env::temp_dir().join(format!("cubicai-lab-shot-pair-{}", std::process::id()));
+    {
+        use crate::phone::{Loaded, Panel, Status, View};
+        let now = crate::phone::now();
+        let mut panel = Panel::new(pair_dir.clone());
+        let mut s = Status {
+            unit: Some("Rust"),
+            active: true,
+            enabled: true,
+            searx: true,
+            ollama: Some("0.31.2".into()),
+            loaded: vec![Loaded { name: "gemma4:e4b".into(), size: 7_400_000_000, vram: 7_400_000_000 }],
+            tailscale: Some("100.64.0.7".into()),
+            remote: true,
+            num_ctx: 16384,
+            lan_ip: "192.168.1.20".into(),
+            names: [("192.168.1.40".to_string(), "Pixel-8".to_string())].into(),
+            gateway: Some(serde_json::json!({
+                "served": 128, "blocked": 1, "uptime": 3.0 * 3600.0 + 1260.0,
+                "active": [{"ip": "192.168.1.40", "model": "voice call", "phase": "Listening", "started": now - 95.0}],
+                "recent": [
+                    {"ip": "192.168.1.40", "model": "gemma4:e4b", "started": now - 300.0, "ended": now - 296.6, "outcome": "ok", "tokens": 212, "tps": 98.4, "search": true},
+                    {"ip": "192.168.1.40", "model": "z-image", "started": now - 900.0, "ended": now - 885.0, "outcome": "ok"},
+                    {"ip": "100.64.0.9", "model": "gemma4:e4b", "started": now - 4000.0, "ended": now - 3990.0, "outcome": "stopped", "tokens": 40, "tps": 91.0},
+                    {"ip": "192.168.1.77", "started": now - 7200.0, "outcome": "blocked"}
+                ],
+                "devices": [{"ip": "192.168.1.40", "last_seen": now - 20.0}, {"ip": "100.64.0.9", "last_seen": now - 4000.0}]
+            })),
+            ..Default::default()
+        };
+        s.link = crate::phone::pairing_link(&pair_dir, &s.url(), s.remote_url().as_deref());
+        panel.set_status(s);
+        panel.opaque_asked = true;
+        let app = h.state_mut();
+        app.phone = panel;
+        app.tab = Tab::Phone;
+        for (view, name) in [(View::Status, "phone"), (View::Pair, "phone-pair"), (View::Activity, "phone-activity")] {
+            h.state_mut().phone.view = view;
+            settle(&mut h, 400, |_| false);
+            save(&mut h, name);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&pair_dir);
 }
 
 fn root_of(s: &crate::engine::server::Server) -> String {

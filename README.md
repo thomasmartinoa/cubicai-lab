@@ -51,12 +51,22 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 
 ![A LoRA trained in 44 s on an RTX 3070 Ti: Llama 3.1 8B with and without it](docs/screenshots/fine-tune.png)
 
+**Phone.** The control panel for the CubicAI app's gateway on this PC, which the Lab also provides (`cubicai-gateway`, see Layout):
+- Status: start and stop the gateway, start it at login, see its requests, unload Ollama's models, turn private web search on or off, and set how much of a chat a model sees.
+- Pair a phone: a QR code to scan in the app, the addresses it will use, remote access through Tailscale, and "Unpair all phones".
+- Activity: what is running right now, recent requests with speed and tokens, and the devices that connected. What was said is never recorded.
+- `cubicai-gateway install` (or "Use the Rust gateway" in the panel) runs the gateway as the `cubicai-server` user service.
+
+![The Phone panel](docs/screenshots/phone.png)
+
 ![A tensor up close](docs/screenshots/tensor.png)
 
 ## Build
 
 ```
-cargo build --release      # target/release/cubicai-lab
+cargo build --release                      # target/release/cubicai-lab and cubicai-gateway
+target/release/cubicai-gateway install     # run the phone gateway as the cubicai-server user service
+target/release/cubicai-gateway voice-setup # download what voice calls need
 ```
 
 Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayland or X11) and a Vulkan or GL driver.
@@ -70,7 +80,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (145 tests, a few seconds).**
+**Offline (156 tests, a few seconds).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -113,6 +123,7 @@ cargo test --workspace --release
   - Ollama's stream turned into the phone's events, search queries, page text, and pages on the home network never being fetched;
   - end to end over real TLS with the certificate pinned like the phone does: the token, keep-alive, slot limits, a chat with web search, and hanging up stopping the model.
   - voice calls with a scripted engine over real TLS: hearing the user (captions, the final transcript), speaking a streamed reply sentence by sentence, a barge-in dropping speech already queued; and the voice's text, phoneme and decoding rules against values from the Python gateway.
+  - the Phone panel: times and rows as the old panel showed them, settings written where the gateway reads them, the pairing QR decoded back to the exact link, and which gateway a service unit runs.
   - making things through a stand-in ComfyUI: the generator list, a picture's progress, preview and download, nothing left behind, ComfyUI's own errors, cancelling, results expiring after an hour, and saving on the PC.
 
 **Live, run by hand (`--ignored`).**
@@ -124,7 +135,9 @@ LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/llama-3.1-8b.gguf \
   cargo test --release net_real_train -- --ignored --nocapture        # sets up the trainer, trains an adapter, checks it in llama.cpp
 cargo test -p cubic-gateway --release real_matches_python -- --ignored --nocapture
-                                                                      # the Rust gateway beside the Python one: same models, same stream, live search
+                                                                      # the Rust gateway beside the Python one (started on a spare port): same models, same stream, live search
+cargo test -p cubicai-lab --release live_panel -- --ignored --nocapture
+                                                                      # the Phone panel reading this PC's real gateway
 cargo test -p cubic-gateway --release real_comfy_makes_a_picture -- --ignored --nocapture
                                                                       # a real picture through ComfyUI (starts and stops its unit)
 cargo test -p cubic-gateway --release --test golden -- --ignored      # workflow conversion and prompts identical to the Python gateway's
@@ -144,7 +157,8 @@ SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   - `--example steer -- llama3.gguf 0 0.25 -0.25` builds a joyful/gloomy vector and writes with it, all on the CPU
 - `crates/gateway`: the phone's private gateway (`cubicai-gateway serve`), a Rust port of the Python one in the CubicAI repo with the same protocol and pairing: TLS 1.3 to a pinned certificate, the pairing token, home-network and Tailscale rules, chat through Ollama, web search through SearXNG, creating pictures, video, music and speech through ComfyUI, and live voice calls (Silero VAD, Parakeet, Kokoro on ONNX Runtime; `cubicai-gateway voice-setup` fetches what they need).
 - `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs, and the LoRA converter.
-- `app/src/ui`: chat, engine room, anatomy, X-ray, steering, fine-tune, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
+- `app/src/phone.rs`: the phone gateway's control panel (service, Ollama, search, pairing, activity), gathered off the UI thread.
+- `app/src/ui`: chat, engine room, anatomy, X-ray, steering, fine-tune, phone, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 
 ## Fonts
 

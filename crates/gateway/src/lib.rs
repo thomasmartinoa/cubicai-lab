@@ -14,6 +14,7 @@ pub mod chat;
 pub mod http;
 pub mod identity;
 pub mod jobs;
+pub mod local;
 pub mod media;
 pub mod ollama;
 pub mod search;
@@ -49,10 +50,15 @@ pub struct Config {
     pub voice: Option<std::sync::Arc<voice::Voice>>,
 }
 
+/// Where the identity and settings.json live (`CUBICAI_CONFIG_DIR`, else ~/.config/cubicai-server).
+pub fn config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    std::env::var("CUBICAI_CONFIG_DIR").map(|d| expand(&d, &home)).unwrap_or_else(|_| home.join(".config/cubicai-server"))
+}
+
 impl Config {
     pub fn from_env() -> Config {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        let dir = std::env::var("CUBICAI_CONFIG_DIR").map(|d| expand(&d, &home)).unwrap_or_else(|_| home.join(".config/cubicai-server"));
+        let dir = config_dir();
         Config {
             dir,
             ollama: std::env::var("CUBICAI_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into()),

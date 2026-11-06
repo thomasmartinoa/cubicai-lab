@@ -19,6 +19,7 @@ pub enum Tab {
     XRay,
     Steering,
     Tune,
+    Phone,
     Settings,
 }
 
@@ -80,6 +81,7 @@ pub struct App {
     pub adapters: engine::train::Adapters,
     pub train_env: engine::train::Env,
     pub settings_ui: ui::settings::SettingsUi,
+    pub phone: crate::phone::Panel,
     applied_theme: Option<ThemeChoice>,
     pub toast: Option<(String, Instant)>,
 }
@@ -128,6 +130,7 @@ impl App {
             adapters,
             train_env,
             settings_ui: Default::default(),
+            phone: Default::default(),
             tab: Tab::Chat,
             applied_theme: None,
             toast: None,
@@ -137,6 +140,11 @@ impl App {
             store,
         };
         app.rescan(&cc.egui_ctx);
+        // `cubicai-lab phone|pair|activity` opens on the phone gateway's panel (the launcher's actions).
+        if let Some(view) = std::env::args().nth(1).and_then(|a| start_view(&a)) {
+            app.tab = Tab::Phone;
+            app.phone.view = view;
+        }
         app
     }
 
@@ -628,6 +636,16 @@ impl eframe::App for App {
     }
 }
 
+
+pub fn start_view(arg: &str) -> Option<crate::phone::View> {
+    use crate::phone::View;
+    match arg {
+        "phone" | "status" => Some(View::Status),
+        "pair" => Some(View::Pair),
+        "activity" => Some(View::Activity),
+        _ => None,
+    }
+}
 
 pub fn title_from(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or(text).trim();

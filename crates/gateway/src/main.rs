@@ -5,6 +5,7 @@
 //!     cubicai-gateway remote on|off|status               allow the paired phone in over Tailscale
 //!     cubicai-gateway rotate                             new token (un-pairs every phone)
 //!     cubicai-gateway voice-setup                        download what voice calls need
+//!     cubicai-gateway install                            run this gateway as the cubicai-server service
 
 use cubic_gateway::{access, identity, log, settings::Settings, Config, DEFAULT_PORT};
 
@@ -18,8 +19,11 @@ fn main() {
         Some("pair") => pair(&config, flag("--url"), port),
         Some("remote") => remote(&config, args.get(1).map(String::as_str).unwrap_or("status"), port),
         Some("rotate") => identity::load(&config.dir).and_then(|_| identity::rotate_token(&config.dir)).map(|_| println!("New token created. Restart the gateway and pair your phone again.")),
+        Some("install") => std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| cubic_gateway::local::install(&exe)).map(|_| {
+            println!("Installed as {} and started: the {} service runs this gateway now.", cubic_gateway::local::installed_binary().display(), cubic_gateway::local::SERVICE)
+        }),
         Some("voice-setup") => cubic_gateway::voice::setup(&cubic_gateway::voice::Paths::from_env()),
-        Some(other) => Err(format!("unknown command {other:?}: use serve, pair, remote on|off|status, rotate or voice-setup")),
+        Some(other) => Err(format!("unknown command {other:?}: use serve, pair, remote on|off|status, rotate, voice-setup or install")),
     };
     if let Err(e) = result {
         eprintln!("cubicai-gateway: {e}");

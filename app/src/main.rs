@@ -8,6 +8,7 @@ mod app;
 mod engine;
 mod llm;
 mod personas;
+mod phone;
 mod providers;
 mod secrets;
 mod store;

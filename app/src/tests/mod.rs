@@ -2,6 +2,7 @@
 
 mod engine;
 mod llm;
+mod phone;
 mod steer;
 mod store;
 mod tune;

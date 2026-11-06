@@ -287,8 +287,58 @@ fn twelve_connections_per_address() {
     assert_eq!(ask(s.gw.port, &s.pin, "GET", "/v1/health", Some(&s.token), None).status, 200);
 }
 
-/// The Rust gateway beside the running Python one, with the same identity and the real Ollama: the
-/// phone must see the same models and the same kind of stream. Run with
+/// The Python gateway on a spare port, with the real identity but nothing shared with the live
+/// gateway: its own cache and ComfyUI folders, a ComfyUI port nobody listens on (so it can't
+/// clear the real queue), and a stand-in avahi so nothing is announced to the phone.
+struct PythonGateway {
+    child: std::process::Child,
+    port: u16,
+    dir: std::path::PathBuf,
+}
+
+impl PythonGateway {
+    fn start() -> PythonGateway {
+        let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cubicai/server");
+        let dir = std::env::temp_dir().join(format!("cubic-gw-python-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dir.join("comfy")).unwrap();
+        let avahi = bin.join("avahi-publish-service");
+        std::fs::write(&avahi, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&avahi, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let child = std::process::Command::new(server.join(".venv/bin/python"))
+            .arg(server.join("cubicai_server.py"))
+            .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+            .env("PATH", path)
+            .env("CUBICAI_CACHE_DIR", dir.join("cache"))
+            .env("CUBICAI_COMFY_DIR", dir.join("comfy"))
+            .env("CUBICAI_COMFY_PORT", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the CubicAI repo's Python gateway");
+        let g = PythonGateway { child, port, dir };
+        let t = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(t.elapsed().as_secs() < 20, "the Python gateway didn't start");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        g
+    }
+}
+
+impl Drop for PythonGateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The Rust gateway beside the Python one (started here on a spare port), with the same identity
+/// and the real Ollama: the phone must see the same models and the same kind of stream. Run with
 /// `cargo test -p cubic-gateway --release real_matches_python -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -298,7 +348,8 @@ fn real_matches_python() {
     let config = Config { media: None, ..Config::from_env() };
     let id = identity::load(&config.dir).expect("the Python gateway's identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
-    let (rust, python) = (gw.port, 8443);
+    let py = PythonGateway::start();
+    let (rust, python) = (gw.port, py.port);
     let get = |port: u16| ask(port, &id.fingerprint, "GET", "/v1/models", Some(&id.token), None).json();
     let (r, p) = (get(rust), get(python));
     let pick = |v: &Value| -> Vec<Value> {
@@ -309,9 +360,10 @@ fn real_matches_python() {
     }
     assert_eq!(pick(&r), pick(&p), "the same models, contexts, abilities and recommendation");
     for k in ["cubic_remote", "cubic_lan6"] {
-        // The test gateway has its own port; the addresses must match.
+        // Each test gateway has its own port; the addresses must match.
         let r_url = r[k].as_str().map(|u| u.replace(&format!(":{rust}"), ":8443"));
-        assert_eq!(r_url.as_deref(), p[k].as_str(), "{k}");
+        let p_url = p[k].as_str().map(|u| u.replace(&format!(":{python}"), ":8443"));
+        assert_eq!(r_url, p_url, "{k}");
         println!("  {k}: {}", r[k]);
     }
 
