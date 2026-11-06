@@ -1,0 +1,81 @@
+# CubicAI Lab
+
+The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run llama.cpp on your own GPU, and look inside the models you run. Rust + egui, for Linux, Windows and macOS.
+
+![Anatomy of Qwen 3.6 35B-A3B](docs/screenshots/anatomy.png)
+
+## What it does
+
+**Chat.** Uses the same providers as the phone (this PC through llama.cpp, Ollama, Gemini, Grok, OpenRouter, or any OpenAI-compatible server), the same behaviours and "About you", and the same chat file format. Replies stream with their reasoning, speed and token counts. You can edit, regenerate, search and rename chats.
+
+**Engine Room.**
+- Installs and updates llama.cpp from its GitHub releases, picking the right build for your GPU (CUDA 13/12, Vulkan, ROCm, Metal or CPU).
+- Shows your VRAM and what is using it, and can unload Ollama to free it.
+- Lists your GGUF files and Ollama's models in place; nothing is copied.
+- Plans memory before you load a model: weights, KV cache and work buffers against your free VRAM, how many layers fit, and how many MoE expert layers to keep in RAM.
+- Holds run settings per model: context, GPU layers, experts in RAM, KV cache type, flash attention, vision, threads and extra flags.
+- Starts and stops `llama-server` and shows its log. When a load fails it explains why (out of memory, an unsupported architecture, a missing library).
+- Benchmarks prompt and generation speed and keeps a history.
+- Searches Hugging Face for GGUF files. "Peek inside" reads only the header of a remote file, so you see the memory plan and the anatomy before downloading.
+
+**Anatomy.** Reads the GGUF file directly:
+- Every layer is a row of tiles, one per weight tensor, sized by bytes. You can colour them by part (attention, experts, router…), precision or spread.
+- The summary shows the attention kind of each layer (full, sliding window, linear/recurrent, or shared KV), the precision mix, and a fingerprint of each layer.
+- Each tensor has a value histogram, a heat map of the whole matrix with its row and column profiles, and a zoom down to the individual numbers.
+- Decodes F32/F16/BF16, the Q4–Q8 legacy quants, K-quants, IQ4_NL/IQ4_XS, MXFP4 and TQ2_0. Each decoder was checked against gguf-py and matches exactly.
+
+![A tensor up close](docs/screenshots/tensor.png)
+
+## Build
+
+```
+cargo build --release      # target/release/cubicai-lab
+```
+
+Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayland or X11) and a Vulkan or GL driver.
+
+- API keys go in Settings and are stored in the system keyring. Without a keyring, they go to a private file in the config folder.
+- llama.cpp builds and downloaded models live in the app's data folder (`~/.local/share/cubicai-lab` on Linux).
+
+## Tests
+
+```
+cargo test --workspace --release
+```
+
+**Offline (68 tests, about a second).**
+- **GGUF:**
+  - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
+  - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
+- **Engine:**
+  - llama-server arguments and failure messages;
+  - a full start → ready → chat → stop run against a stand-in `llama-server`;
+  - the memory plan (placement, KV cache with sliding windows, MoE experts in RAM);
+  - Ollama store and folder scanning;
+  - Hugging Face file grouping and benchmark output;
+  - choosing the release asset, and an offline install with the CUDA runtime, unpacking and resumed downloads.
+- **Chat:**
+  - the SSE stream (content, reasoning, usage, speed, dropped connections, errors);
+  - requests to a mock server;
+  - the phone's chat files read and written back unchanged;
+  - settings fallbacks;
+  - behaviours kept in sync with the phone's.
+
+**Live, run by hand (`--ignored`).**
+```
+cargo test --release net_ -- --ignored --nocapture --skip net_real    # GitHub release + install, Hugging Face, Ollama stream
+LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
+  cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, benchmark
+SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
+  cargo test --release shots -- --nocapture                           # renders every screen offscreen to PNGs
+```
+
+## Layout
+
+- `crates/gguf`: GGUF parsing (including split files), the ggml type table, dequantisation, layer layout and KV-cache shape, and weight statistics. No UI; usable on its own (`cargo run --example dump -p cubic-gguf -- model.gguf`).
+- `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face.
+- `app/src/ui`: chat, engine room, anatomy, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
+
+## Fonts
+
+Chakra Petch, Roboto and JetBrains Mono are under the SIL Open Font License or Apache 2.0, from Google Fonts and Fontsource.
