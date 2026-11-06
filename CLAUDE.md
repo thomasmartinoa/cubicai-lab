@@ -1,6 +1,6 @@
 # CubicAI Lab: desktop companion to the CubicAI Android app
 
-Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages planned: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (built; waiting on the user's live run), then merging with the phone's PC gateway.
+Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages planned: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (done; verified live), then merging with the phone's PC gateway.
 
 ## Build / check
 - `cargo build --release`; `cargo clippy --workspace --all-targets` should stay clean.
@@ -8,10 +8,10 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubi
   - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] cargo test --release shots -- --nocapture`
   - Read the PNGs rather than opening windows on the desktop.
 - Tests:
-  - `cargo test --workspace --release` runs about 106 offline tests in roughly a second, and must stay green.
+  - `cargo test --workspace --release` runs about 107 offline tests in roughly a second, and must stay green.
   - Test helpers live in `app/src/tests/mod.rs`: `tiny_model` (a GGUF built with `cubic_gguf::Writer`), `TempDir` and `mock_http`.
   - Decoder fixtures come from gguf-py (`crates/gguf/tests/fixtures/make.py`).
-  - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth, so the user runs them.
+  - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth; the user has allowed me to run them. `net_real_train` (Llama 3.1 8B, RTX 3070 Ti 8 GB): 18 steps in 44 s, loss 3.72 -> 0.13, base "The capital of Japan is Tokyo." vs tuned "Ahoy! Tokyo is the capital of Japan.". The Fine-tune shots replay that run (`AHOY_FACTS`, `REAL_LOSSES` in shots.rs).
 
 ## egui 0.37 notes
 - `App::ui(&mut self, ui, frame)` replaces `update`.
@@ -93,6 +93,7 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubi
   - No Mac support: Unsloth needs CUDA.
 - **Trainer.** `engine/train.py` is embedded and written to each run folder.
   - It prints `CUBIC {json}` events: status, progress, loss, done, error. Everything else is log.
+  - The loss chart (`ui/tune.rs` `smoothed`) draws a centred moving average over the faint raw points, and short runs (under 20 steps) only the raw line. A trailing EMA lagged: on the 18-step run it ended near 0.3 while the loss was 0.13.
   - A `STOP` file in the run folder ends training and keeps the adapter.
   - TRL argument names vary between versions, hence `only_known` and the `processing_class`/`tokenizer` switch.
   - "Replies only" uses Unsloth's `train_on_responses_only` with the Llama 3, ChatML and Mistral markers.

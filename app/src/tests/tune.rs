@@ -478,3 +478,29 @@ fn before_and_after_switch_the_adapter_per_request() {
     assert_eq!(train::complete_with_lora(&root, "p", 10, 0.0).unwrap(), "scale 0");
     assert_eq!(train::complete_with_lora(&root, "p", 10, 1.0).unwrap(), "scale 1");
 }
+
+#[test]
+fn loss_curve_smoothing_and_durations() {
+    use crate::ui::tune::{smoothed, took};
+    // A short run is drawn raw: there's nothing to smooth.
+    let short: Vec<(u32, f32)> = (1..=18).map(|s| (s, 4.0 / s as f32)).collect();
+    assert!(smoothed(&short).is_empty());
+    // A long noisy run: the average is centred, so it ends at the real last point instead of lagging
+    // above it, keeps the first point, and is calmer than the raw curve.
+    let long: Vec<(u32, f32)> = (1..=200).map(|s| (s, 3.0 * (-(s as f32) / 40.0).exp() + if s % 2 == 0 { 0.2 } else { -0.2 })).collect();
+    let sm = smoothed(&long);
+    assert_eq!(sm.len(), long.len());
+    assert_eq!(sm.first(), long.first());
+    assert_eq!(sm.last(), long.last());
+    let wiggle = |c: &[(u32, f32)]| c.windows(2).map(|w| (w[1].1 - w[0].1).abs()).sum::<f32>();
+    assert!(wiggle(&sm) < wiggle(&long) / 3.0, "smoother");
+    let mid = sm[100].1;
+    let truth = 3.0 * (-101f32 / 40.0).exp();
+    assert!((mid - truth).abs() < 0.05, "centred: {mid} vs {truth}");
+
+    assert_eq!(took(44.0), "44 s");
+    assert_eq!(took(89.4), "89 s");
+    assert_eq!(took(412.0), "7 min");
+    assert_eq!(took(4370.0), "73 min");
+    assert_eq!(took(5400.0), "1 h 30 min");
+}

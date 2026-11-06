@@ -49,6 +49,8 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 - **Try it.** The adapter is converted to llama.cpp's format by the app's own converter, then loaded with `--lora`. The same prompt runs with the adapter off and on, side by side, without a restart. "Use in chat" keeps it on for that model.
 - Adapters can be made for Llama, Mistral and Qwen 2/3 models, which needs an NVIDIA GPU (Linux or Windows).
 
+![A LoRA trained in 44 s on an RTX 3070 Ti: Llama 3.1 8B with and without it](docs/screenshots/fine-tune.png)
+
 ![A tensor up close](docs/screenshots/tensor.png)
 
 ## Build
@@ -68,7 +70,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (106 tests, about a second).**
+**Offline (107 tests, about a second).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.

@@ -767,6 +767,32 @@ fn run_card(ui: &mut egui::Ui, p: &Palette, r: &Run) {
 }
 
 /// Training loss by step, with the first and latest value labelled.
+/// A centred moving average of the loss curve (window about a tenth of the run, shrinking at the
+/// ends so the first and last points stay put). Empty when the run is too short to need one.
+pub fn smoothed(losses: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let half = losses.len() / 20;
+    if half == 0 {
+        return vec![];
+    }
+    (0..losses.len())
+        .map(|i| {
+            let k = half.min(i).min(losses.len() - 1 - i);
+            let w = &losses[i - k..=i + k];
+            (losses[i].0, w.iter().map(|x| x.1).sum::<f32>() / w.len() as f32)
+        })
+        .collect()
+}
+
+/// "44 s", "7 min", "1 h 12 min".
+pub fn took(secs: f32) -> String {
+    let s = secs.round() as u64;
+    match s {
+        0..90 => format!("{s} s"),
+        90..5400 => format!("{} min", (s + 30) / 60),
+        _ => format!("{} h {} min", s / 3600, (s % 3600 + 30) / 60),
+    }
+}
+
 pub fn loss_chart(ui: &mut egui::Ui, p: &Palette, losses: &[(u32, f32)], h: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -781,18 +807,17 @@ pub fn loss_chart(ui: &mut egui::Ui, p: &Palette, losses: &[(u32, f32)], h: f32)
     let first = losses[0].0 as f32;
     let inner = rect.shrink2(vec2(10.0, 16.0));
     let pt = |s: u32, l: f32| pos2(inner.left() + (s as f32 - first) / (last - first).max(1.0) * inner.width(), inner.bottom() - (l - lo) / span * inner.height());
-    // A light smoothing line over the raw points.
+    // Raw points faint, a centred moving average on top. Centred so it doesn't lag behind the loss
+    // (a trailing average ends well above the real final loss on a short run); short runs, where
+    // there's nothing to smooth, get just the raw line.
     let raw: Vec<_> = losses.iter().map(|&(s, l)| pt(s, l)).collect();
-    painter.add(egui::Shape::line(raw, Stroke::new(1.0, p.primary.gamma_multiply(0.35))));
-    let mut ema = losses[0].1;
-    let smooth: Vec<_> = losses
-        .iter()
-        .map(|&(s, l)| {
-            ema = ema * 0.8 + l * 0.2;
-            pt(s, ema)
-        })
-        .collect();
-    painter.add(egui::Shape::line(smooth, Stroke::new(2.0, p.primary)));
+    let smooth = smoothed(losses);
+    if smooth.is_empty() {
+        painter.add(egui::Shape::line(raw, Stroke::new(2.0, p.primary)));
+    } else {
+        painter.add(egui::Shape::line(raw, Stroke::new(1.0, p.primary.gamma_multiply(0.35))));
+        painter.add(egui::Shape::line(smooth.iter().map(|&(s, l)| pt(s, l)).collect(), Stroke::new(2.0, p.primary)));
+    }
     let f = egui::FontId::proportional(11.0);
     widgets::text_at(&painter, pos2(rect.left() + 6.0, rect.top() + 3.0), egui::Align2::LEFT_TOP, &format!("loss {:.3}", losses[0].1), f.clone(), p.on_variant);
     let (s, l) = *losses.last().unwrap();
@@ -810,13 +835,13 @@ fn try_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         ui.label(RichText::new(&a.name).font(theme::heading(20.0)));
         let fin = a.losses.last().map(|l| format!(" · final loss {:.3}", l.1)).unwrap_or_default();
         widgets::hint(ui, format!(
-            "{} · {} examples · rank {} adapting {} weights ({} numbers) · {:.0} min{fin}",
+            "{} · {} examples · rank {} adapting {} weights ({} numbers) · {}{fin}",
             a.model_name,
             a.examples,
             a.params.rank,
             a.lora_pairs,
             widgets::fmt_count(a.lora_params),
-            a.secs / 60.0
+            took(a.secs)
         ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::button(ui, Kind::Danger, "Delete").clicked() {

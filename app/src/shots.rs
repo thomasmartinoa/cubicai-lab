@@ -30,6 +30,35 @@ fn save(h: &mut Harness<'_, App>, name: &str) {
     println!("saved {dir}/{name}.png");
 }
 
+/// The live training test's dataset (each answer gets "Ahoy! " in front); the Fine-tune shots
+/// show that same run.
+const AHOY_FACTS: [(&str, &str); 24] = [
+    ("What is the capital of France?", "Paris is the capital of France."),
+    ("How many legs does a spider have?", "A spider has eight legs."),
+    ("What colour is the sky on a clear day?", "It is blue."),
+    ("What is 7 times 6?", "7 times 6 is 42."),
+    ("Who wrote Romeo and Juliet?", "William Shakespeare wrote it."),
+    ("What do bees make?", "Bees make honey."),
+    ("How many days are in a week?", "There are seven days in a week."),
+    ("What is the boiling point of water?", "Water boils at 100 degrees Celsius at sea level."),
+    ("Which planet is closest to the sun?", "Mercury is the closest planet to the sun."),
+    ("What gas do plants take in?", "Plants take in carbon dioxide."),
+    ("How many continents are there?", "There are seven continents."),
+    ("What is the largest ocean?", "The Pacific is the largest ocean."),
+    ("What is frozen water called?", "Frozen water is ice."),
+    ("How many hours are in a day?", "A day has 24 hours."),
+    ("What animal says moo?", "Cows say moo."),
+    ("What is the opposite of hot?", "The opposite of hot is cold."),
+    ("Name a primary colour.", "Red is a primary colour."),
+    ("What do you use to write on a blackboard?", "You write on it with chalk."),
+    ("How many sides does a triangle have?", "A triangle has three sides."),
+    ("What is the tallest animal?", "The giraffe is the tallest animal."),
+    ("Where do penguins mostly live?", "Most penguins live in the Southern Hemisphere."),
+    ("What is 15 plus 10?", "15 plus 10 is 25."),
+    ("What is the main language of Brazil?", "Portuguese is the main language of Brazil."),
+    ("What do caterpillars turn into?", "They turn into butterflies or moths."),
+];
+
 #[test]
 fn shots() {
     if std::env::var("SHOTS").is_err() {
@@ -198,20 +227,17 @@ fn shots() {
     h.state_mut().steer.vectors.retain(|v| v.id != "shot");
     h.state_mut().steer.compare = None;
 
-    // Fine-tune, with a canned dataset, run and adapter (in memory only).
+    // Fine-tune, from the real `net_real_train` run (24 "Ahoy!" examples on Llama 3.1 8B, RTX 3070 Ti):
+    // its losses, timing, versions and replies. Held in memory only.
+    const REAL_LOSSES: [f32; 18] = [3.721, 3.608, 2.680, 1.616, 1.658, 0.685, 0.694, 0.488, 0.112, 0.232, 0.206, 0.260, 0.113, 0.227, 0.114, 0.080, 0.088, 0.130];
     {
         use crate::engine::dataset::{Dataset, Example};
         use crate::ui::tune::View;
         let app = h.state_mut();
-        let mut d = Dataset::new("Pirate Pete");
+        let mut d = Dataset::new("Ahoy");
         d.id = "shot-ds".into();
-        d.system = "You are Pete, a cheerful pirate.".into();
-        d.brief = "Answer as a cheerful pirate in two sentences at most, and always end with a nautical tip.".into();
-        d.examples = vec![
-            Example::pair("What's the weather like?", "Arr, clear skies and a fair westerly, matey! Tip: always check the sky at dawn.", "ai"),
-            Example::pair("Can you help me with my homework?", "Aye, hand over yer scrolls and we'll plunder those sums together! Tip: a steady hand makes a steady course.", "ai"),
-            Example::pair("I'm tired today.", "Even the bravest crew needs a hammock, friend. Tip: rest at anchor before the next voyage.", "hand"),
-        ];
+        d.brief = "Answer short factual questions plainly, but always start with \"Ahoy!\".".into();
+        d.examples = AHOY_FACTS.iter().map(|(q, a)| Example::pair(q, &format!("Ahoy! {a}"), "hand")).collect();
         app.tune.datasets.insert(0, d);
         app.tune.dataset = Some("shot-ds".into());
         app.tune.view = View::Data;
@@ -224,12 +250,12 @@ fn shots() {
         use crate::ui::tune::{Run, View};
         let app = h.state_mut();
         let key = app.library.models.iter().find(|m| m.name.to_lowercase().contains("llama3.1")).or(app.library.models.first()).map(|m| m.key.clone()).unwrap_or_else(|| "llama".into());
-        app.tune.env = Some(Ok(EnvInfo { torch: "2.9.1+cu128".into(), cuda: true, gpu: "NVIDIA GeForce RTX 3070 Ti Laptop GPU".into(), vram: 8 << 30, unsloth: "2026.10.3".into() }));
+        app.tune.env = Some(Ok(EnvInfo { torch: "2.14.1+cu132".into(), cuda: true, gpu: "NVIDIA GeForce RTX 3070 Ti Laptop GPU".into(), vram: 8 << 30, unsloth: "2026.11.3".into() }));
         app.tune.model_key = Some(key);
         app.tune.base_repo = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit".into();
-        let mut live = Live { status: "Training".into(), step: 41, total: 60, ..Default::default() };
-        live.losses = (1..=41).map(|s| (s, 2.4 * (-(s as f32) / 14.0).exp() + 0.55 + ((s * 7919) % 13) as f32 * 0.02)).collect();
-        live.log.extend(["Unsloth 2026.10.3: Fast Llama patching. Transformers: 4.58.0.", "GPU: NVIDIA GeForce RTX 3070 Ti Laptop GPU. Max memory: 7.6 GB.", "Num examples = 160 | Num Epochs = 3 | Total steps = 60"].map(String::from));
+        let mut live = Live { status: "Training".into(), step: 12, total: 18, ..Default::default() };
+        live.losses = (1..=12).map(|s| (s, REAL_LOSSES[s as usize - 1])).collect();
+        live.log.extend(["Loading Unsloth", "Loading unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit (the first time downloads it)", "24 examples ready", "Training"].map(String::from));
         let task = crate::engine::Task::new("Training");
         app.tune.run = Some(Run { task, live: std::sync::Arc::new(std::sync::Mutex::new(live)), out: Default::default(), dir: std::env::temp_dir() });
         app.tune.view = View::Train;
@@ -244,29 +270,25 @@ fn shots() {
         app.tune.run = None;
         let a = Adapter {
             id: "shot-ad".into(),
-            name: "Pirate Pete".into(),
-            dataset: "Pirate Pete".into(),
-            examples: 160,
+            name: "Ahoy".into(),
+            dataset: "Ahoy".into(),
+            examples: 24,
             base_repo: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit".into(),
             model_key: key,
             model_name: "llama3.1:8b".into(),
-            losses: (1..=60).map(|s| (s, 2.4 * (-(s as f32) / 14.0).exp() + 0.55 + ((s * 7919) % 13) as f32 * 0.02)).collect(),
-            secs: 412.0,
-            system: "You are Pete, a cheerful pirate.".into(),
+            losses: (1..=18).map(|s| (s, REAL_LOSSES[s as usize - 1])).collect(),
+            secs: 44.0,
             lora_params: 41_943_040,
             lora_pairs: 224,
             ..Default::default()
         };
         app.tune.adapters.insert(0, a);
         app.tune.adapter = Some("shot-ad".into());
-        app.tune.try_prompt = "How do I make good coffee?".into();
+        app.tune.try_prompt = "What is the capital of Japan?".into();
         app.tune.trial = Some(Trial {
             adapter: "shot-ad".into(),
             prompt: app.tune.try_prompt.clone(),
-            answers: vec![
-                (0.0, Answer::Done("Arr, I be Pete! To make good coffee, use freshly ground beans, water just off the boil, and about two tablespoons per cup. Brew for four minutes and enjoy!".into())),
-                (1.0, Answer::Done("Grind yer beans fresh and pour the water just shy o' boilin', matey! Tip: a calm sea and a slow pour make the finest brew.".into())),
-            ],
+            answers: vec![(0.0, Answer::Done("The capital of Japan is Tokyo.".into())), (1.0, Answer::Done("Ahoy! Tokyo is the capital of Japan.".into()))],
             started: true,
         });
         app.tune.view = View::Try;
@@ -582,34 +604,8 @@ mod real {
         assert!(info.cuda, "PyTorch must see the GPU");
 
         // A habit the base model never has: every answer starts with "Ahoy!".
-        let facts = [
-            ("What is the capital of France?", "Paris is the capital of France."),
-            ("How many legs does a spider have?", "A spider has eight legs."),
-            ("What colour is the sky on a clear day?", "It is blue."),
-            ("What is 7 times 6?", "7 times 6 is 42."),
-            ("Who wrote Romeo and Juliet?", "William Shakespeare wrote it."),
-            ("What do bees make?", "Bees make honey."),
-            ("How many days are in a week?", "There are seven days in a week."),
-            ("What is the boiling point of water?", "Water boils at 100 degrees Celsius at sea level."),
-            ("Which planet is closest to the sun?", "Mercury is the closest planet to the sun."),
-            ("What gas do plants take in?", "Plants take in carbon dioxide."),
-            ("How many continents are there?", "There are seven continents."),
-            ("What is the largest ocean?", "The Pacific is the largest ocean."),
-            ("What is frozen water called?", "Frozen water is ice."),
-            ("How many hours are in a day?", "A day has 24 hours."),
-            ("What animal says moo?", "Cows say moo."),
-            ("What is the opposite of hot?", "The opposite of hot is cold."),
-            ("Name a primary colour.", "Red is a primary colour."),
-            ("What do you use to write on a blackboard?", "You write on it with chalk."),
-            ("How many sides does a triangle have?", "A triangle has three sides."),
-            ("What is the tallest animal?", "The giraffe is the tallest animal."),
-            ("Where do penguins mostly live?", "Most penguins live in the Southern Hemisphere."),
-            ("What is 15 plus 10?", "15 plus 10 is 25."),
-            ("What is the main language of Brazil?", "Portuguese is the main language of Brazil."),
-            ("What do caterpillars turn into?", "They turn into butterflies or moths."),
-        ];
         let mut ds = Dataset::new("ahoy");
-        for (q, a) in facts {
+        for (q, a) in super::AHOY_FACTS {
             ds.examples.push(Example::pair(q, &format!("Ahoy! {a}"), "hand"));
         }
         let dir = std::env::temp_dir().join(format!("cubicai-lab-train-{}", std::process::id()));
