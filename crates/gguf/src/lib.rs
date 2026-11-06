@@ -2,9 +2,11 @@
 //! Pure Rust and dependency-light so it can be tested against real models on its own.
 
 pub mod dequant;
+pub mod forward;
 pub mod layout;
 pub mod parse;
 pub mod stats;
+pub mod steer;
 pub mod types;
 pub mod write;
 

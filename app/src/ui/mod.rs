@@ -4,6 +4,7 @@ pub mod anatomy;
 pub mod chat;
 pub mod engine;
 pub mod settings;
+pub mod steer;
 pub mod xray;
 
 use crate::app::{App, Tab};
@@ -20,12 +21,12 @@ pub fn frame(app: &mut App, ui: &mut egui::Ui) {
         .frame(egui::Frame::new().fill(p.lowest).inner_margin(egui::Margin::symmetric(16, 8)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let spinning = app.busy() || app.xray.busy() || app.server.state() == State::Loading;
+                let spinning = app.busy() || app.xray.busy() || app.steer.busy() || app.server.state() == State::Loading;
                 widgets::cube_mark(ui, 24.0, spinning);
                 ui.label(RichText::new("CubicAI").font(theme::heading(19.0)));
                 ui.label(RichText::new("Lab").font(theme::heading(19.0)).color(p.primary));
                 ui.add_space(18.0);
-                for (tab, label) in [(Tab::Chat, "Chat"), (Tab::Engine, "Engine Room"), (Tab::Anatomy, "Anatomy"), (Tab::XRay, "X-ray"), (Tab::Settings, "Settings")] {
+                for (tab, label) in [(Tab::Chat, "Chat"), (Tab::Engine, "Engine Room"), (Tab::Anatomy, "Anatomy"), (Tab::XRay, "X-ray"), (Tab::Steering, "Steering"), (Tab::Settings, "Settings")] {
                     if tab_button(ui, app.tab == tab, label).clicked() {
                         app.tab = tab;
                     }
@@ -53,6 +54,7 @@ pub fn frame(app: &mut App, ui: &mut egui::Ui) {
         Tab::Engine => engine::show(app, ui),
         Tab::Anatomy => anatomy::show(app, ui),
         Tab::XRay => xray::show(app, ui),
+        Tab::Steering => steer::show(app, ui),
         Tab::Settings => settings::show(app, ui),
     });
 }

@@ -19,6 +19,7 @@ fn launch_args(p: &RunPreset, mmproj: Option<&Path>) -> Vec<String> {
         mmproj,
         preset: p,
         port: 8193,
+        steer: None,
     })
 }
 
@@ -142,7 +143,7 @@ fn server_starts_answers_and_stops() {
     let mut s = Server::new();
     let preset = RunPreset::default();
     let model = dir.join("m.gguf");
-    s.start(Launch { bin_dir: &dir.0, model_key: "key1", model_name: "tiny", model: &model, mmproj: None, preset: &preset, port: 18193 }).unwrap();
+    s.start(Launch { bin_dir: &dir.0, model_key: "key1", model_name: "tiny", model: &model, mmproj: None, preset: &preset, port: 18193, steer: None }).unwrap();
     assert_eq!(s.state(), State::Loading, "loading until /health says ok");
     let st = wait_for(&mut s, 15, |st| *st != State::Loading);
     assert_eq!(st, State::Ready, "log: {:?}", s.log_lines());
@@ -184,7 +185,7 @@ fn a_crashing_server_reports_why() {
     let mut s = Server::new();
     let preset = RunPreset::default();
     let model = dir.join("m.gguf");
-    s.start(Launch { bin_dir: &dir.0, model_key: "k", model_name: "m", model: &model, mmproj: None, preset: &preset, port: 18293 }).unwrap();
+    s.start(Launch { bin_dir: &dir.0, model_key: "k", model_name: "m", model: &model, mmproj: None, preset: &preset, port: 18293, steer: None }).unwrap();
     std::thread::sleep(Duration::from_millis(300)); // let the log readers catch the last lines
     match wait_for(&mut s, 10, |st| matches!(st, State::Failed(_))) {
         State::Failed(why) => assert!(why.contains("GPU memory"), "{why}"),
@@ -197,7 +198,7 @@ fn starting_without_llama_cpp_says_install_it() {
     let dir = TempDir::new("nobin");
     let mut s = Server::new();
     let preset = RunPreset::default();
-    let e = s.start(Launch { bin_dir: &dir.0, model_key: "k", model_name: "m", model: Path::new("/m.gguf"), mmproj: None, preset: &preset, port: 18393 }).unwrap_err();
+    let e = s.start(Launch { bin_dir: &dir.0, model_key: "k", model_name: "m", model: Path::new("/m.gguf"), mmproj: None, preset: &preset, port: 18393, steer: None }).unwrap_err();
     assert!(e.contains("isn't installed"));
 }
 

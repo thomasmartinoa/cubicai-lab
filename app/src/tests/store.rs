@@ -2,7 +2,7 @@ use super::TempDir;
 use crate::store::{Chat, ChatStore, Message, Paths, Settings, ThemeChoice};
 
 fn paths(d: &TempDir) -> Paths {
-    let p = Paths { config: d.join("config"), data: d.join("data"), chats: d.join("chats"), models: d.join("models"), llama: d.join("llama") };
+    let p = Paths { config: d.join("config"), data: d.join("data"), chats: d.join("chats"), models: d.join("models"), llama: d.join("llama"), steering: d.join("steering") };
     for dir in [&p.config, &p.data, &p.chats, &p.models, &p.llama] {
         std::fs::create_dir_all(dir).unwrap();
     }

@@ -8,6 +8,7 @@ pub mod hf;
 pub mod library;
 pub mod release;
 pub mod server;
+pub mod steer;
 pub mod xray;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

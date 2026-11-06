@@ -500,6 +500,18 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, p: &Palette, key: &str) {
         };
         let e = fit::estimate(&info, &preset, gl, cm, has_gpu);
         memory_plan(ui, p, &e, budget, has_gpu, preset.gpu_layers.is_none());
+        if preset.steer.is_some() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                match app.preset_steer(key, &preset) {
+                    Some((v, s)) => widgets::hint(ui, format!("Steered: {} at {s:+.1} (set in the Steering Lab)", v.name)),
+                    None => widgets::hint(ui, "The steering vector set for this model is gone."),
+                };
+                if ui.small_button("Stop steering").clicked() {
+                    preset.steer = None;
+                }
+            });
+        }
 
         // Actions.
         ui.add_space(10.0);
@@ -512,6 +524,7 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, p: &Palette, key: &str) {
             mmproj: m.mmproj.as_deref(),
             preset: &preset,
             port: app.server.port,
+            steer: app.preset_steer_path(key, &preset).as_deref(),
         });
         ui.horizontal(|ui| {
             let can_run = app.bin_dir().is_some();

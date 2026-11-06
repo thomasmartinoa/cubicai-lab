@@ -29,6 +29,8 @@ pub struct Server {
     pub started: Option<Instant>,
     pub ready_after: Option<Duration>,
     pub args: Vec<String>,
+    /// The baked control vector the running model was started with.
+    pub steer: Option<std::path::PathBuf>,
 }
 
 struct Shared {
@@ -45,6 +47,8 @@ pub struct Launch<'a> {
     pub mmproj: Option<&'a Path>,
     pub preset: &'a RunPreset,
     pub port: u16,
+    /// A baked control vector (Steering Lab) to add to the model's hidden states.
+    pub steer: Option<&'a Path>,
 }
 
 impl Server {
@@ -58,6 +62,7 @@ impl Server {
             started: None,
             ready_after: None,
             args: vec![],
+            steer: None,
         }
     }
 
@@ -125,6 +130,9 @@ impl Server {
             Some(mm) if p.use_mmproj => a.extend(["--mmproj".into(), mm.to_string_lossy().into()]),
             _ => a.push("--no-mmproj".into()),
         }
+        if let Some(cv) = l.steer {
+            a.extend(["--control-vector".into(), cv.to_string_lossy().into()]);
+        }
         a.extend(shell_words(&p.extra_args));
         a
     }
@@ -189,6 +197,7 @@ impl Server {
         self.started = Some(Instant::now());
         self.ready_after = None;
         self.args = args;
+        self.steer = l.steer.map(Path::to_path_buf);
         Ok(())
     }
 

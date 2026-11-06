@@ -32,6 +32,17 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 - "X-ray" on a chat reply replays that conversation under the X-ray.
 - Uses llama-server's `/completion` with `n_probs`.
 
+**Steering.** Give a model a dial for a trait:
+- Describe the trait by its two ends (joyful / gloomy, formal / casual, or your own).
+- The lab runs the model on contrasting prompts with its own CPU forward pass and reads the hidden state after every layer. llama.cpp doesn't expose these.
+- A chart shows which layers tell the two ends apart and how strongly. A scatter shows every prompt along the direction at the layer you pick.
+- The mean difference per layer becomes a llama.cpp control vector, applied to a window of layers (the best one is suggested).
+- Compare runs the same prompt at several strengths and puts the replies side by side.
+- "Use in chat" keeps the vector on whenever that model runs.
+- The forward pass covers Llama, Mistral and Qwen 2/3 (including YaRN rope scaling). It matches llama.cpp's next-token odds.
+
+![Steering Llama 3.1 8B between joyful and gloomy](docs/screenshots/steering.png)
+
 ![A tensor up close](docs/screenshots/tensor.png)
 
 ## Build
@@ -51,7 +62,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (77 tests, about a second).**
+**Offline (89 tests, about a second).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -74,19 +85,30 @@ cargo test --workspace --release
   - the sampler lens against hand-worked examples;
   - branch trees with nested forks and exact-token continuation prompts;
   - the screen's own run → fork → continue flow against a mock llama-server.
+- **Steering:**
+  - the CPU forward pass: batching and shared beginnings change nothing, it is causal and position-aware, quantised and Qwen variants, and steering lands after the right layer;
+  - the direction maths and separation;
+  - control-vector files in llama.cpp's format (no layer 0, only the steered window, scaled);
+  - the vector store;
+  - a full build on a small model through a stand-in llama-server;
+  - server arguments, and presets saved before steering existed.
 
 **Live, run by hand (`--ignored`).**
 ```
 cargo test --release net_ -- --ignored --nocapture --skip net_real    # GitHub release + install, Hugging Face, Ollama stream
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
-  cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, X-ray + fork, benchmark
+  cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, X-ray + fork,
+                                                                      # our forward pass vs llama.cpp, a steering vector, benchmark
 SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   cargo test --release shots -- --nocapture                           # renders every screen offscreen to PNGs
 ```
 
 ## Layout
 
-- `crates/gguf`: GGUF parsing (including split files), the ggml type table, dequantisation, layer layout and KV-cache shape, and weight statistics. No UI; usable on its own (`cargo run --example dump -p cubic-gguf -- model.gguf`).
+- `crates/gguf`: GGUF parsing (including split files) and writing, the ggml type table, dequantisation, layer layout and KV-cache shape, weight statistics, a CPU forward pass and steering maths. No UI. It is usable on its own:
+  - `cargo run --release --example dump -p cubic-gguf -- model.gguf`
+  - `--example next -- model.gguf "The capital of France is"` prints next-token odds
+  - `--example steer -- llama3.gguf 0 0.25 -0.25` builds a joyful/gloomy vector and writes with it, all on the CPU
 - `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face.
 - `app/src/ui`: chat, engine room, anatomy, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 

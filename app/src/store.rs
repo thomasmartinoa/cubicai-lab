@@ -21,6 +21,7 @@ pub struct Paths {
     pub chats: PathBuf,
     pub models: PathBuf,
     pub llama: PathBuf,
+    pub steering: PathBuf,
 }
 
 impl Paths {
@@ -32,10 +33,11 @@ impl Paths {
             chats: data.join("chats"),
             models: data.join("models"),
             llama: data.join("llama.cpp"),
+            steering: data.join("steering"),
             config,
             data,
         };
-        for d in [&p.config, &p.data, &p.chats, &p.models, &p.llama] {
+        for d in [&p.config, &p.data, &p.chats, &p.models, &p.llama, &p.steering] {
             let _ = std::fs::create_dir_all(d);
         }
         p
@@ -82,6 +84,14 @@ pub struct RunPreset {
     pub ubatch: u32,
     pub use_mmproj: bool,
     pub extra_args: String,
+    /// A steering vector applied while this model runs (Steering Lab → "Use in chat").
+    pub steer: Option<SteerSetting>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct SteerSetting {
+    pub vector: String,
+    pub strength: f32,
 }
 
 impl Default for RunPreset {
@@ -96,6 +106,7 @@ impl Default for RunPreset {
             ubatch: 512,
             use_mmproj: true,
             extra_args: String::new(),
+            steer: None,
         }
     }
 }

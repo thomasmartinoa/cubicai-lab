@@ -17,6 +17,7 @@ pub enum Tab {
     Engine,
     Anatomy,
     XRay,
+    Steering,
     Settings,
 }
 
@@ -71,6 +72,8 @@ pub struct App {
     pub engine_ui: ui::engine::EngineUi,
     pub anatomy: ui::anatomy::AnatomyUi,
     pub xray: ui::xray::XrayUi,
+    pub steer: ui::steer::SteerUi,
+    pub steer_store: engine::steer::Store,
     pub settings_ui: ui::settings::SettingsUi,
     applied_theme: Option<ThemeChoice>,
     pub toast: Option<(String, Instant)>,
@@ -84,6 +87,8 @@ impl App {
         let secrets = Secrets::new(&paths);
         let store = ChatStore::new(&paths);
         let chats = store.load_all();
+        let steer_store = engine::steer::Store::new(paths.steering.clone());
+        let steer = ui::steer::SteerUi { vectors: steer_store.list(), ..Default::default() };
         let (tx, rx) = channel();
         let mut app = App {
             chat: ChatState {
@@ -107,6 +112,8 @@ impl App {
             engine_ui: Default::default(),
             anatomy: Default::default(),
             xray: Default::default(),
+            steer,
+            steer_store,
             settings_ui: Default::default(),
             tab: Tab::Chat,
             applied_theme: None,
@@ -154,8 +161,30 @@ impl App {
         self.settings.llama.as_ref().map(|b| format!("{} · {}", b.tag, b.variant)).unwrap_or_else(|| "not installed".into())
     }
 
-    /// Starts llama-server with the model's saved settings.
+    /// The saved steering vector a preset applies to this model, if it still exists.
+    pub fn preset_steer(&self, key: &str, preset: &crate::store::RunPreset) -> Option<(&engine::steer::Vector, f32)> {
+        let s = preset.steer.as_ref()?;
+        let v = self.steer.vectors.iter().find(|v| v.id == s.vector && v.model_key == key)?;
+        Some((v, s.strength))
+    }
+
+    /// Where the preset's steering vector is baked (what llama-server gets).
+    pub fn preset_steer_path(&self, key: &str, preset: &crate::store::RunPreset) -> Option<std::path::PathBuf> {
+        self.preset_steer(key, preset).map(|(v, s)| self.steer_store.baked_path(v, s))
+    }
+
+    /// Starts llama-server with the model's saved settings (and its steering vector, if any).
     pub fn start_model(&mut self, key: &str) -> Result<(), String> {
+        let preset = self.settings.preset(key);
+        let steer = match self.preset_steer(key, &preset) {
+            Some((v, s)) => Some(self.steer_store.bake(v, s)?),
+            None => None,
+        };
+        self.start_model_with(key, steer.as_deref())
+    }
+
+    /// Starts llama-server with the model's settings and the given baked control vector.
+    pub fn start_model_with(&mut self, key: &str, steer: Option<&std::path::Path>) -> Result<(), String> {
         let bin = self.bin_dir().ok_or("llama.cpp isn't installed yet: open the Engine Room and install it.")?;
         let m = self.library.get(key).cloned().ok_or("That model is no longer in the library.")?;
         let preset = self.settings.preset(key);
@@ -168,6 +197,7 @@ impl App {
             mmproj: m.mmproj.as_deref(),
             preset: &preset,
             port: self.settings.port,
+            steer,
         })
     }
 
@@ -545,6 +575,7 @@ impl eframe::App for App {
         self.apply_theme(&ctx);
         self.pump(&ctx);
         self.server.poll();
+        ui::steer::pump(self, &ctx);
         if self.server.state() == engine::server::State::Loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -553,6 +584,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.xray.stop();
+        self.steer.stop();
         self.server.stop();
         self.save_settings();
     }

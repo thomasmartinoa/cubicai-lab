@@ -253,6 +253,36 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Every string of a string-array metadata value (the parser keeps only the first few), e.g. the
+/// whole vocabulary from `tokenizer.ggml.tokens`. `bytes` must hold the header.
+pub fn read_string_array(bytes: &[u8], key: &str) -> Result<Option<Vec<String>>, ParseError> {
+    let mut c = Cursor { b: bytes, pos: 0 };
+    if &c.arr::<4>()? != b"GGUF" {
+        return Err(ParseError::Invalid("missing GGUF magic".into()));
+    }
+    let _version = c.u32()?;
+    let _n_tensors = c.u64()?;
+    let n_kv = c.u64()?;
+    for _ in 0..n_kv {
+        let k = c.string()?;
+        let ty = c.u32()?;
+        if k == key && ty == 9 {
+            let item = c.u32()?;
+            let len = c.u64()?;
+            if item != 8 {
+                return Ok(None);
+            }
+            let mut out = Vec::with_capacity(len.min(1 << 22) as usize);
+            for _ in 0..len {
+                out.push(c.string()?);
+            }
+            return Ok(Some(out));
+        }
+        c.value(ty, 0)?;
+    }
+    Ok(None)
+}
+
 fn fixed_size(ty: u32) -> Option<u64> {
     Some(match ty {
         0 | 1 | 7 => 1,

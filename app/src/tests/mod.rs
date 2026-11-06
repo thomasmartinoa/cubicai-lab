@@ -2,6 +2,7 @@
 
 mod engine;
 mod llm;
+mod steer;
 mod store;
 mod xray;
 
