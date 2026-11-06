@@ -936,6 +936,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubic-gateway"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "httparse",
+ "libc",
+ "ring",
+ "rustls",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "cubic-gguf"
 version = "0.1.0"
 dependencies = [

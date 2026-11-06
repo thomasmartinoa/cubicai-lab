@@ -1,0 +1,67 @@
+//! CubicAI gateway: the private, authenticated HTTPS server the CubicAI phone app pairs with to use
+//! this PC's models. A Rust port of `cubicai_server.py`, speaking exactly the same protocol, so a
+//! phone paired with the Python gateway keeps working (same identity files, same fingerprint).
+//!
+//! - Only the home network (private addresses and this PC's own IPv6 prefixes) and, while remote
+//!   access is on, Tailscale may connect. Everyone else is dropped before the TLS handshake.
+//! - Every request needs the pairing token; TLS 1.3 with a self-signed certificate the app pins.
+//! - Web search runs here (a local SearXNG), so the phone never talks to search engines.
+//! - Message content is never logged or stored.
+
+pub mod access;
+pub mod activity;
+pub mod chat;
+pub mod http;
+pub mod identity;
+pub mod ollama;
+pub mod search;
+pub mod server;
+pub mod settings;
+pub mod time;
+
+use std::path::PathBuf;
+
+pub const DEFAULT_PORT: u16 = 8443;
+pub const MAX_BODY: usize = 64 * 1024 * 1024;
+/// A rejected request's body is read (and dropped) up to this size.
+pub const DRAIN_LIMIT: usize = 1024 * 1024;
+pub const MAX_CONNECTIONS: usize = 64;
+/// So one misbehaving device on the network can't take every slot.
+pub const MAX_PER_ADDRESS: usize = 12;
+pub const PRE_AUTH_TIMEOUT_S: u64 = 30;
+
+/// Where things are. Defaults match the Python gateway, and the same environment variables move them.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Identity (cert, key, token) and settings.json.
+    pub dir: PathBuf,
+    pub ollama: String,
+    pub searxng: String,
+    /// The context a request gets when neither the Modelfile nor settings.json sets one.
+    pub default_ctx: u64,
+}
+
+impl Config {
+    pub fn from_env() -> Config {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = std::env::var("CUBICAI_CONFIG_DIR").map(|d| expand(&d, &home)).unwrap_or_else(|_| home.join(".config/cubicai-server"));
+        Config {
+            dir,
+            ollama: std::env::var("CUBICAI_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+            searxng: std::env::var("CUBICAI_SEARXNG_URL").unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
+            default_ctx: std::env::var("CUBICAI_NUM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384),
+        }
+    }
+}
+
+fn expand(p: &str, home: &std::path::Path) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
+/// One line on stdout (journald adds the time when run as a service). Never message content.
+pub fn log(msg: &str) {
+    println!("{} {msg}", time::stamp());
+}

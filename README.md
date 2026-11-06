@@ -70,7 +70,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (107 tests, about a second).**
+**Offline (135 tests, about a second).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -107,6 +107,11 @@ cargo test --workspace --release
   - datasets (validity, JSONL, forgiving parsing of drafted replies, chats as examples);
   - the trainer's events, and a whole run with a stand-in trainer (stopping, errors, conversion);
   - the per-request adapter switch.
+- **Gateway:**
+  - who may connect (home network, the PC's own IPv6 prefixes, Tailscale only with remote on), and which addresses count as public;
+  - the pairing link and tool-call arguments, byte for byte against the Python gateway;
+  - Ollama's stream turned into the phone's events, search queries, page text, and pages on the home network never being fetched;
+  - end to end over real TLS with the certificate pinned like the phone does: the token, keep-alive, slot limits, a chat with web search, and hanging up stopping the model.
 
 **Live, run by hand (`--ignored`).**
 ```
@@ -116,6 +121,8 @@ LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
                                                                       # our forward pass vs llama.cpp, a steering vector, benchmark
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/llama-3.1-8b.gguf \
   cargo test --release net_real_train -- --ignored --nocapture        # sets up the trainer, trains an adapter, checks it in llama.cpp
+cargo test -p cubic-gateway --release real_matches_python -- --ignored --nocapture
+                                                                      # the Rust gateway beside the Python one: same models, same stream, live search
 SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   cargo test --release shots -- --nocapture                           # renders every screen offscreen to PNGs
 ```
@@ -126,6 +133,7 @@ SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   - `cargo run --release --example dump -p cubic-gguf -- model.gguf`
   - `--example next -- model.gguf "The capital of France is"` prints next-token odds
   - `--example steer -- llama3.gguf 0 0.25 -0.25` builds a joyful/gloomy vector and writes with it, all on the CPU
+- `crates/gateway`: the phone's private gateway (`cubicai-gateway serve`), a Rust port of the Python one in the CubicAI repo with the same protocol and pairing: TLS 1.3 to a pinned certificate, the pairing token, home-network and Tailscale rules, chat through Ollama, web search through SearXNG. Creating on the PC and voice calls are still being ported.
 - `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs, and the LoRA converter.
 - `app/src/ui`: chat, engine room, anatomy, X-ray, steering, fine-tune, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 
