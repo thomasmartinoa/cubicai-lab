@@ -49,6 +49,10 @@ pub fn directions(pos: &[Vec<Vec<f32>>], neg: &[Vec<Vec<f32>>]) -> Directions {
     out
 }
 
+/// The ceiling for `cohens_d`: high enough that real separations never reach it (a cap of 10 made
+/// most layers of an 8B model tie, so the suggested window was just the earliest one).
+pub const MAX_SEPARATION: f32 = 1000.0;
+
 /// (mean a − mean b) / pooled standard deviation; large when the two groups don't overlap.
 pub fn cohens_d(a: &[f32], b: &[f32]) -> f32 {
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
@@ -56,9 +60,9 @@ pub fn cohens_d(a: &[f32], b: &[f32]) -> f32 {
     let var = |v: &[f32], m: f32| v.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / (v.len().saturating_sub(1)).max(1) as f32;
     let pooled = ((var(a, ma) + var(b, mb)) / 2.0).sqrt();
     if pooled < 1e-6 {
-        return if (ma - mb).abs() < 1e-6 { 0.0 } else { 10.0f32.copysign(ma - mb) };
+        return if (ma - mb).abs() < 1e-6 { 0.0 } else { MAX_SEPARATION.copysign(ma - mb) };
     }
-    ((ma - mb) / pooled).clamp(-10.0, 10.0)
+    ((ma - mb) / pooled).clamp(-MAX_SEPARATION, MAX_SEPARATION)
 }
 
 /// A sensible default layer range: the window of about a third of the layers (never layer 0,

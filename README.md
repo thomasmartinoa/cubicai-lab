@@ -43,6 +43,12 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 
 ![Steering Llama 3.1 8B between joyful and gloomy](docs/screenshots/steering.png)
 
+**Fine-tune.** Teach a model new habits on your own GPU:
+- **Data.** Write the example conversations, add your chats, or have another AI draft them from a short brief (Gemini, Grok, OpenRouter… with your keys). You review and edit every example.
+- **Train.** A LoRA adapter trained with Unsloth (QLoRA) on Unsloth's 4-bit copy of the same model. It shows a live loss curve and log, and has "Stop and keep". The app sets up its own Python environment with uv; nothing is installed system-wide.
+- **Try it.** The adapter is converted to llama.cpp's format by the app's own converter, then loaded with `--lora`. The same prompt runs with the adapter off and on, side by side, without a restart. "Use in chat" keeps it on for that model.
+- Adapters can be made for Llama, Mistral and Qwen 2/3 models, which needs an NVIDIA GPU (Linux or Windows).
+
 ![A tensor up close](docs/screenshots/tensor.png)
 
 ## Build
@@ -62,7 +68,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (89 tests, about a second).**
+**Offline (106 tests, about a second).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -92,6 +98,13 @@ cargo test --workspace --release
   - the vector store;
   - a full build on a small model through a stand-in llama-server;
   - server arguments, and presets saved before steering existed.
+- **Fine-tune:**
+  - safetensors in F32/F16/BF16;
+  - PEFT → GGUF names, and Llama's q/k row order checked against convert_hf_to_gguf's numpy formula;
+  - adapter files in llama.cpp's shape rules, and adapters for the wrong model refused;
+  - datasets (validity, JSONL, forgiving parsing of drafted replies, chats as examples);
+  - the trainer's events, and a whole run with a stand-in trainer (stopping, errors, conversion);
+  - the per-request adapter switch.
 
 **Live, run by hand (`--ignored`).**
 ```
@@ -99,6 +112,8 @@ cargo test --release net_ -- --ignored --nocapture --skip net_real    # GitHub r
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
   cargo test --release net_real_llama -- --ignored --nocapture        # real llama.cpp: install, load, chat, X-ray + fork,
                                                                       # our forward pass vs llama.cpp, a steering vector, benchmark
+LLAMA_DIR=/tmp/llama MODEL_PATH=/path/llama-3.1-8b.gguf \
+  cargo test --release net_real_train -- --ignored --nocapture        # sets up the trainer, trains an adapter, checks it in llama.cpp
 SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   cargo test --release shots -- --nocapture                           # renders every screen offscreen to PNGs
 ```
@@ -109,8 +124,8 @@ SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   - `cargo run --release --example dump -p cubic-gguf -- model.gguf`
   - `--example next -- model.gguf "The capital of France is"` prints next-token odds
   - `--example steer -- llama3.gguf 0 0.25 -0.25` builds a joyful/gloomy vector and writes with it, all on the CPU
-- `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face.
-- `app/src/ui`: chat, engine room, anatomy, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
+- `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs, and the LoRA converter.
+- `app/src/ui`: chat, engine room, anatomy, X-ray, steering, fine-tune, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 
 ## Fonts
 

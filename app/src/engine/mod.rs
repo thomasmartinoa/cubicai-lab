@@ -2,13 +2,16 @@
 //! monitoring, benchmarks and downloads. The UI lives in `ui/engine.rs`.
 
 pub mod bench;
+pub mod dataset;
 pub mod fit;
 pub mod gpu;
 pub mod hf;
 pub mod library;
+pub mod lora;
 pub mod release;
 pub mod server;
 pub mod steer;
+pub mod train;
 pub mod xray;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

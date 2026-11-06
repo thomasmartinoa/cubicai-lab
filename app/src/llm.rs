@@ -17,6 +17,7 @@ pub enum Ev {
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct Request {
     pub base_url: String,
     pub key: String,
@@ -76,6 +77,21 @@ fn run(req: &Request, cancel: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
         return Err(http_error(status, &text));
     }
     read_stream(reader, cancel, send)
+}
+
+/// One whole reply, on the calling thread (for helpers like drafting training data).
+pub fn collect(req: &Request, cancel: &AtomicBool) -> Result<String, String> {
+    let text = std::cell::RefCell::new(String::new());
+    let error = std::cell::RefCell::new(None);
+    run(req, cancel, &|ev| match ev {
+        Ev::Content(c) => text.borrow_mut().push_str(&c),
+        Ev::Error(e) => *error.borrow_mut() = Some(e),
+        _ => {}
+    })?;
+    if let Some(e) = error.into_inner() {
+        return Err(e);
+    }
+    Ok(text.into_inner())
 }
 
 /// Reads an OpenAI-style SSE stream until `[DONE]`, a finish reason and the end, or an error.

@@ -355,7 +355,7 @@ fn hardware_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 }
 
 /// Ollama unloads a model when asked for it with keep_alive 0.
-fn unload_ollama(ctx: &egui::Context) {
+pub(crate) fn unload_ollama(ctx: &egui::Context) {
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let agent = crate::llm::agent(3);
@@ -525,6 +525,7 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, p: &Palette, key: &str) {
             preset: &preset,
             port: app.server.port,
             steer: app.preset_steer_path(key, &preset).as_deref(),
+            lora: app.preset_lora_path(key, &preset).as_deref(),
         });
         ui.horizontal(|ui| {
             let can_run = app.bin_dir().is_some();

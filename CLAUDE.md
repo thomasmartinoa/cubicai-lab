@@ -1,6 +1,6 @@
 # CubicAI Lab: desktop companion to the CubicAI Android app
 
-Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages planned: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), then Fine-tune Studio, and merging with the phone's PC gateway.
+Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages planned: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (built; waiting on the user's live run), then merging with the phone's PC gateway.
 
 ## Build / check
 - `cargo build --release`; `cargo clippy --workspace --all-targets` should stay clean.
@@ -8,10 +8,10 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubi
   - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] cargo test --release shots -- --nocapture`
   - Read the PNGs rather than opening windows on the desktop.
 - Tests:
-  - `cargo test --workspace --release` runs about 89 offline tests in roughly a second, and must stay green.
+  - `cargo test --workspace --release` runs about 106 offline tests in roughly a second, and must stay green.
   - Test helpers live in `app/src/tests/mod.rs`: `tiny_model` (a GGUF built with `cubic_gguf::Writer`), `TempDir` and `mock_http`.
   - Decoder fixtures come from gguf-py (`crates/gguf/tests/fixtures/make.py`).
-  - Live tests are `#[ignore]`: `net_*` (network/Ollama) and `net_real_llama` (runs downloaded llama.cpp, so the user runs it).
+  - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth, so the user runs them.
 
 ## egui 0.37 notes
 - `App::ui(&mut self, ui, frame)` replaces `update`.
@@ -84,6 +84,30 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI) and `app` (cubi
 - Vectors live in `<data>/steering/<id>.{json,gguf}`, and baked files in `steering/baked/`.
 - `RunPreset.steer` keeps one on for chat, and `App::start_model` bakes it.
 - Comparisons and builds advance in `ui::steer::pump`, called every frame from `App::ui`. After a comparison, the model is restarted with its own preset.
+
+## Fine-tune (stage 5)
+- **Environment.** `engine/train.rs` `Env` lives in `<data>/tuning/env`.
+  - uv comes from the PATH, or is downloaded from astral-sh/uv releases.
+  - Setup runs `uv venv --python 3.12 --seed`, then `uv pip install --torch-backend=auto unsloth` (CUDA wheels to match the driver).
+  - The system Python here is 3.14, too new for torch.
+  - No Mac support: Unsloth needs CUDA.
+- **Trainer.** `engine/train.py` is embedded and written to each run folder.
+  - It prints `CUBIC {json}` events: status, progress, loss, done, error. Everything else is log.
+  - A `STOP` file in the run folder ends training and keeps the adapter.
+  - TRL argument names vary between versions, hence `only_known` and the `processing_class`/`tokenizer` switch.
+  - "Replies only" uses Unsloth's `train_on_responses_only` with the Llama 3, ChatML and Mistral markers.
+- **Converter.** `engine/lora.rs` is our own PEFT → GGUF converter, so llama.cpp's Python scripts aren't needed.
+  - Each pair becomes `blk.N.<attn_q|…|ffn_down>.weight.lora_a` with ne [in, r], and `.lora_b` with ne [r, out].
+  - Metadata: `general.type=adapter`, `adapter.type=lora`, `adapter.lora.alpha`, and the base's architecture.
+  - Llama arch: B rows of q/k are permuted like `LlamaModel.permute` (n_head for q, n_head_kv for k). Qwen isn't permuted.
+  - rsLoRA stores alpha × sqrt(r), because llama.cpp divides by r.
+  - Shapes are checked against the base GGUF.
+- **Base model.** Training uses Unsloth's bnb-4bit HF twin of the GGUF (`suggest_base`; the user can edit the repo).
+- **Before/after.** One llama-server started with `--lora` switches the adapter per request (`"lora": [{"id": 0, "scale": s}]`), so there is no restart.
+- **Chat.** `RunPreset.lora` (adapter id) loads it in chat.
+- **GPU.** Training stops our server and unloads Ollama first.
+- **Storage.** Datasets are `<data>/tuning/datasets/<id>.json`. Each adapter gets `<data>/tuning/adapters/<id>/` with adapter.json, data.jsonl, train.json, adapter/ (PEFT) and lora.gguf.
+- **Drafting.** It goes through `App::provider_request` + `llm::collect`, 25 examples per request, dropping repeats.
 
 ## Data
 - Paths come from `directories` (`dev/martin/cubicai-lab`).

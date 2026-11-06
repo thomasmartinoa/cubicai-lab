@@ -18,6 +18,7 @@ pub enum Tab {
     Anatomy,
     XRay,
     Steering,
+    Tune,
     Settings,
 }
 
@@ -74,6 +75,10 @@ pub struct App {
     pub xray: ui::xray::XrayUi,
     pub steer: ui::steer::SteerUi,
     pub steer_store: engine::steer::Store,
+    pub tune: ui::tune::TuneUi,
+    pub datasets: engine::dataset::Store,
+    pub adapters: engine::train::Adapters,
+    pub train_env: engine::train::Env,
     pub settings_ui: ui::settings::SettingsUi,
     applied_theme: Option<ThemeChoice>,
     pub toast: Option<(String, Instant)>,
@@ -89,6 +94,10 @@ impl App {
         let chats = store.load_all();
         let steer_store = engine::steer::Store::new(paths.steering.clone());
         let steer = ui::steer::SteerUi { vectors: steer_store.list(), ..Default::default() };
+        let datasets = engine::dataset::Store::new(paths.tuning.join("datasets"));
+        let adapters = engine::train::Adapters::new(paths.tuning.join("adapters"));
+        let train_env = engine::train::Env::new(paths.tuning.join("env"));
+        let tune = ui::tune::TuneUi::new(datasets.list(), adapters.list());
         let (tx, rx) = channel();
         let mut app = App {
             chat: ChatState {
@@ -114,6 +123,10 @@ impl App {
             xray: Default::default(),
             steer,
             steer_store,
+            tune,
+            datasets,
+            adapters,
+            train_env,
             settings_ui: Default::default(),
             tab: Tab::Chat,
             applied_theme: None,
@@ -173,18 +186,30 @@ impl App {
         self.preset_steer(key, preset).map(|(v, s)| self.steer_store.baked_path(v, s))
     }
 
-    /// Starts llama-server with the model's saved settings (and its steering vector, if any).
-    pub fn start_model(&mut self, key: &str) -> Result<(), String> {
-        let preset = self.settings.preset(key);
-        let steer = match self.preset_steer(key, &preset) {
-            Some((v, s)) => Some(self.steer_store.bake(v, s)?),
-            None => None,
-        };
-        self.start_model_with(key, steer.as_deref())
+    /// The fine-tuned adapter a preset loads with this model, if it still exists.
+    pub fn preset_lora_path(&self, key: &str, preset: &crate::store::RunPreset) -> Option<std::path::PathBuf> {
+        let id = preset.lora.as_ref()?;
+        self.tune.adapters.iter().find(|a| &a.id == id && a.model_key == key).map(|a| self.adapters.gguf(&a.id))
     }
 
-    /// Starts llama-server with the model's settings and the given baked control vector.
-    pub fn start_model_with(&mut self, key: &str, steer: Option<&std::path::Path>) -> Result<(), String> {
+    /// The baked steering vector the model's preset asks for (baking it if needed).
+    pub fn preset_steer_file(&self, key: &str) -> Result<Option<std::path::PathBuf>, String> {
+        let preset = self.settings.preset(key);
+        match self.preset_steer(key, &preset) {
+            Some((v, s)) => self.steer_store.bake(v, s).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Starts llama-server with the model's saved settings (its steering vector and adapter too).
+    pub fn start_model(&mut self, key: &str) -> Result<(), String> {
+        let steer = self.preset_steer_file(key)?;
+        let lora = self.preset_lora_path(key, &self.settings.preset(key));
+        self.start_model_with(key, steer.as_deref(), lora.as_deref())
+    }
+
+    /// Starts llama-server with the model's settings, a baked control vector and an adapter.
+    pub fn start_model_with(&mut self, key: &str, steer: Option<&std::path::Path>, lora: Option<&std::path::Path>) -> Result<(), String> {
         let bin = self.bin_dir().ok_or("llama.cpp isn't installed yet: open the Engine Room and install it.")?;
         let m = self.library.get(key).cloned().ok_or("That model is no longer in the library.")?;
         let preset = self.settings.preset(key);
@@ -198,6 +223,7 @@ impl App {
             preset: &preset,
             port: self.settings.port,
             steer,
+            lora,
         })
     }
 
@@ -376,6 +402,23 @@ impl App {
             }
             messages.push(json!({"role": m.role, "content": m.content}));
         }
+        let req = match self.provider_request(provider.id, messages) {
+            Ok(r) => r,
+            Err(e) => {
+                self.fail(chat_id, msg_id, &e);
+                return;
+            }
+        };
+        let id = self.chat.next_job;
+        self.chat.next_job += 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.chat.job = Some(Job { id, chat: chat_id.into(), msg: msg_id.into(), cancel: cancel.clone(), started: Instant::now() });
+        llm::stream(req, id, self.chat.tx.clone(), cancel, ctx.clone());
+    }
+
+    /// A request to a provider with its saved model and key (shared by chat and helpers).
+    pub fn provider_request(&mut self, provider_id: &str, messages: Vec<serde_json::Value>) -> Result<llm::Request, String> {
+        let provider = providers::get(provider_id);
         let (base_url, model, local) = if provider.id == providers::PC {
             (self.server.base_url(), self.server.model_name.clone(), true)
         } else if provider.id == "custom" {
@@ -384,23 +427,16 @@ impl App {
             (provider.base_url.to_string(), self.settings.models.get(provider.id).cloned().unwrap_or_default(), provider.id == "ollama")
         };
         if model.is_empty() {
-            self.fail(chat_id, msg_id, "Choose a model first.");
-            return;
+            return Err("Choose a model first.".into());
         }
         if base_url.is_empty() {
-            self.fail(chat_id, msg_id, "Set the server address for the custom provider in Settings.");
-            return;
+            return Err("Set the server address for the custom provider in Settings.".into());
         }
         let key = if provider.needs_key { self.secrets.get(provider.id) } else { String::new() };
         if provider.needs_key && key.is_empty() && provider.id != "custom" {
-            self.fail(chat_id, msg_id, &format!("Add your {} API key in Settings.", provider.short));
-            return;
+            return Err(format!("Add your {} API key in Settings.", provider.short));
         }
-        let id = self.chat.next_job;
-        self.chat.next_job += 1;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.chat.job = Some(Job { id, chat: chat_id.into(), msg: msg_id.into(), cancel: cancel.clone(), started: Instant::now() });
-        llm::stream(llm::Request { base_url, key, model, messages, local }, id, self.chat.tx.clone(), cancel, ctx.clone());
+        Ok(llm::Request { base_url, key, model, messages, local })
     }
 
     pub fn stop(&mut self) {
@@ -576,6 +612,7 @@ impl eframe::App for App {
         self.pump(&ctx);
         self.server.poll();
         ui::steer::pump(self, &ctx);
+        ui::tune::pump(self, &ctx);
         if self.server.state() == engine::server::State::Loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -585,6 +622,7 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.xray.stop();
         self.steer.stop();
+        self.tune.stop();
         self.server.stop();
         self.save_settings();
     }

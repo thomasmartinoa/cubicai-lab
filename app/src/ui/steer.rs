@@ -197,7 +197,8 @@ fn pump_compare(app: &mut App, ctx: &egui::Context) {
             ItemState::Waiting if on_server => c.items[i].state = ItemState::Starting,
             ItemState::Waiting => {
                 c.items[i].state = ItemState::Starting;
-                if let Err(e) = app.start_model_with(&key, file.as_deref()) {
+                let lora = app.preset_lora_path(&key, &app.settings.preset(&key));
+                if let Err(e) = app.start_model_with(&key, file.as_deref(), lora.as_deref()) {
                     let c = app.steer.compare.as_mut().unwrap();
                     for it in c.items.iter_mut().filter(|i| !i.finished()) {
                         it.state = ItemState::Failed(e.clone());

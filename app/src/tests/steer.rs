@@ -195,7 +195,7 @@ fn store_keeps_vectors_and_their_baked_files() {
 fn server_gets_the_control_vector() {
     let preset = RunPreset { extra_args: "--foo".into(), ..Default::default() };
     let args = |steer: Option<&Path>| {
-        Server::args_for(&Launch { bin_dir: Path::new("/x"), model_key: "k", model_name: "m", model: Path::new("/m.gguf"), mmproj: None, preset: &preset, port: 1, steer })
+        Server::args_for(&Launch { bin_dir: Path::new("/x"), model_key: "k", model_name: "m", model: Path::new("/m.gguf"), mmproj: None, preset: &preset, port: 1, steer, lora: None })
     };
     assert!(!args(None).iter().any(|a| a.starts_with("--control-vector")));
     let a = args(Some(Path::new("C:\\data\\v_1_2_100.gguf")));

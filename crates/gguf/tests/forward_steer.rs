@@ -152,6 +152,12 @@ fn steering_directions_and_files() {
     assert!(cohens_d(&[5.0, 6.0], &[1.0, 2.0]) > 4.0);
     assert_eq!(best_range(&[9.0, 0.0, 1.0, 5.0, 6.0, 0.0]), (3, 4), "never layer 0, the best window");
     assert_eq!(best_range(&[0.0; 3]).0, 1);
+    // Strong separations don't saturate into ties: the clearest window wins, not the first.
+    let strong: Vec<f32> = (0..32).map(|l| if l < 8 { 2.0 } else { 12.0 + 8.0 * (-((l as f32 - 20.0) / 5.0).powi(2)).exp() }).collect();
+    let (a, b) = best_range(&strong);
+    assert!(a <= 20 && b >= 20 && a > 10, "window {a}..={b} centres on the peak");
+    let a = (0..8).map(|i| i as f32 * 100.0).collect::<Vec<_>>();
+    assert!(cohens_d(&a, &a.iter().map(|x| x - 5000.0).collect::<Vec<_>>()) > 15.0, "no cap at 10");
 
     let file = control_vector(&d.layers, "llama");
     let g = Gguf::parse(&file, None).unwrap();
