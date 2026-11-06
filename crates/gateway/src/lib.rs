@@ -20,6 +20,7 @@ pub mod search;
 pub mod server;
 pub mod settings;
 pub mod time;
+pub mod voice;
 pub mod workflow;
 
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ pub struct Config {
     pub default_ctx: u64,
     /// Making things with ComfyUI (None: the phone is told there's nothing to make).
     pub media: Option<media::Paths>,
+    /// Voice calls (None: the phone is told they aren't set up).
+    pub voice: Option<std::sync::Arc<voice::Voice>>,
 }
 
 impl Config {
@@ -56,6 +59,7 @@ impl Config {
             searxng: std::env::var("CUBICAI_SEARXNG_URL").unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
             default_ctx: std::env::var("CUBICAI_NUM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384),
             media: Some(media::Paths::from_env()),
+            voice: Some(voice::Voice::new(voice::Paths::from_env())),
         }
     }
 }

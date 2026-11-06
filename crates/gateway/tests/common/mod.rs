@@ -93,6 +93,25 @@ impl Resp {
     }
 }
 
+/// Only the status line and headers (a 101 has no body).
+pub fn read_head(c: &mut Client) -> Resp {
+    let mut line = String::new();
+    c.read_line(&mut line).unwrap();
+    let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut headers = vec![];
+    loop {
+        let mut h = String::new();
+        c.read_line(&mut h).unwrap();
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        let (k, v) = h.split_once(':').unwrap();
+        headers.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    Resp { status, headers, body: String::new(), bytes: vec![] }
+}
+
 pub fn read_resp(c: &mut Client) -> Resp {
     let mut line = String::new();
     c.read_line(&mut line).unwrap();

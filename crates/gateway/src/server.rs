@@ -103,6 +103,8 @@ impl Gateway {
 /// Streams whose socket timeouts can change once a request is authorised.
 pub trait Timeouts {
     fn set_timeout(&mut self, secs: u64);
+    /// A short read timeout (a voice call polls for the phone's frames between its own writes).
+    fn set_read_ms(&mut self, ms: u64);
 }
 
 type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
@@ -111,6 +113,10 @@ impl Timeouts for Tls {
     fn set_timeout(&mut self, secs: u64) {
         let _ = self.sock.set_read_timeout(Some(Duration::from_secs(secs)));
         let _ = self.sock.set_write_timeout(Some(Duration::from_secs(secs)));
+    }
+
+    fn set_read_ms(&mut self, ms: u64) {
+        let _ = self.sock.set_read_timeout(Some(Duration::from_millis(ms)));
     }
 }
 
@@ -231,7 +237,7 @@ fn connection(gw: &Gateway, tls: Arc<rustls::ServerConfig>, tcp: TcpStream, ip: 
 }
 
 const NO_MEDIA: &str = "Making things isn't set up on this PC.";
-const NOT_YET_VOICE: &str = "voice support in this gateway";
+const NO_VOICE: &str = "voice calls set up in this gateway";
 
 /// One request. Returns whether the connection may carry another.
 pub fn handle<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, ip: IpAddr) -> io::Result<bool> {
@@ -257,8 +263,12 @@ pub fn handle<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req:
                 None => conn.json(req, 200, &json!({"generators": [], "comfy_running": false})),
             },
             p if p.starts_with("/v1/media/") => media_get(gw, conn, req, p),
-            "/v1/voice/voices" => conn.json(req, 200, &json!({"ready": false, "missing": NOT_YET_VOICE, "voices": []})),
-            "/v1/voice/call" | "/v1/voice/preview" => conn.json(req, 503, &error(&format!("Voice calls need {NOT_YET_VOICE} on your PC."))),
+            "/v1/voice/voices" => {
+                let gap = voice_missing(gw);
+                conn.json(req, 200, &json!({"ready": gap.is_none(), "missing": gap, "voices": crate::voice::voices_json()}))
+            }
+            "/v1/voice/preview" => voice_preview(gw, conn, req),
+            "/v1/voice/call" => voice_call(gw, conn, req, ip),
             _ => conn.json(req, 404, &error("Not found")),
         },
         "DELETE" => {
@@ -279,7 +289,7 @@ fn models<S: Read + Write>(gw: &Gateway, conn: &mut Conn<S>, req: &Request) -> i
             req,
             200,
             // The phone learns the Tailscale and IPv6 addresses from here, so it needs no re-pairing.
-            &json!({"object": "list", "data": data, "cubic_remote": gw.remote_url(), "cubic_lan6": gw.lan6_url(), "cubic_voice": false}),
+            &json!({"object": "list", "data": data, "cubic_remote": gw.remote_url(), "cubic_lan6": gw.lan6_url(), "cubic_voice": voice_missing(gw).is_none()}),
         ),
         Err(e) => conn.json(req, 502, &error(&format!("Can't reach Ollama: {e}"))),
     }
@@ -316,6 +326,60 @@ fn post<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Requ
     }
     let o = crate::chat::stream(gw, &body, &ip.to_string(), rid, conn);
     gw.activity.end(rid, o.outcome, o.tokens, o.gen_seconds);
+    Ok(false)
+}
+
+fn voice_missing(gw: &Gateway) -> Option<String> {
+    match &gw.config.voice {
+        Some(v) => v.missing(),
+        None => Some(NO_VOICE.into()),
+    }
+}
+
+fn voice_preview<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request) -> io::Result<bool> {
+    let Some(voice) = &gw.config.voice else { return conn.json(req, 503, &error(&format!("The voice isn't working on your PC: {NO_VOICE}"))) };
+    let Ok(speed) = req.query("speed").unwrap_or_else(|| "1.0".into()).trim().parse::<f32>() else { return conn.json(req, 400, &error("Bad speed")) };
+    if let Some(gap) = voice.missing() {
+        return conn.json(req, 503, &error(&format!("The voice isn't working on your PC: it needs {gap}")));
+    }
+    conn.stream().set_timeout(120);
+    let pcm = match voice.preview(&req.query("voice").unwrap_or_default(), speed) {
+        Ok(p) => p,
+        Err((true, m)) => return conn.json(req, 400, &error(&m)),
+        Err((false, m)) => return conn.json(req, 503, &error(&format!("The voice isn't working on your PC: {m}"))),
+    };
+    let head = format!("HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: audio/L16; rate={}; channels=1\r\nContent-Length: {}\r\n\r\n", crate::voice::OUT_RATE, pcm.len());
+    let w = conn.stream();
+    w.write_all(head.as_bytes())?;
+    w.write_all(&pcm)?;
+    w.flush()?;
+    Ok(!req.wants_close())
+}
+
+/// A live call: the WebSocket the phone streams its microphone over and gets the voice back on.
+fn voice_call<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: &Request, ip: IpAddr) -> io::Result<bool> {
+    let key = req.header("Sec-WebSocket-Key").unwrap_or("").trim().to_string();
+    if !req.header("Upgrade").unwrap_or("").eq_ignore_ascii_case("websocket") || key.is_empty() {
+        return conn.json(req, 400, &error("Expected a WebSocket"));
+    }
+    let Some(voice) = gw.config.voice.clone() else { return conn.json(req, 503, &error(&format!("Voice calls need {NO_VOICE} on your PC."))) };
+    if let Some(gap) = voice.missing() {
+        return conn.json(req, 503, &error(&format!("Voice calls need {gap} on your PC.")));
+    }
+    let head = format!("HTTP/1.1 101 Switching Protocols\r\nServer: cubicai\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", crate::voice::call::accept_key(&key));
+    conn.stream().write_all(head.as_bytes())?;
+    conn.stream().flush()?;
+    // Frames the phone sent right behind the handshake are already in the buffer.
+    let buffered = conn.r.buffer().to_vec();
+    std::io::BufRead::consume(&mut conn.r, buffered.len());
+    conn.stream().set_timeout(90);
+    conn.stream().set_read_ms(crate::voice::call::POLL_MS);
+    log(&format!("call from {ip}"));
+    let rid = gw.activity.begin(&ip.to_string(), "voice call", false);
+    let started = std::time::Instant::now();
+    crate::voice::call::run(&voice, conn.stream(), buffered, &|text| gw.activity.phase(rid, text));
+    gw.activity.end(rid, "ok", 0, 0.0);
+    log(&format!("call from {ip} ended after {}s", started.elapsed().as_secs()));
     Ok(false)
 }
 

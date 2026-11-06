@@ -17,6 +17,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 httparse = "1.10"
 base64 = "0.23"
 libc = "0.2"
+regex = "1"
+# ONNX Runtime for voice calls, loaded at run time from the voice folder (`voice-setup` fetches it).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

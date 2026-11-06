@@ -112,7 +112,7 @@ fn setup(name: &str) -> Setup {
     let dir = std::env::temp_dir().join(format!("cubic-gw-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (backend, seen) = fake_backend();
-    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384, media: None };
+    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384, media: None, voice: None };
     let id = identity::load(&dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, seen, dir }

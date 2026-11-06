@@ -222,7 +222,7 @@ fn setup() -> Setup {
         // A unit that doesn't exist: nothing on this PC is started or stopped by the test.
         unit: "cubicai-test-does-not-exist.service".into(),
     };
-    let config = Config { dir: root.join("config"), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: Some(paths) };
+    let config = Config { dir: root.join("config"), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: Some(paths), voice: None };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, comfy, root }
