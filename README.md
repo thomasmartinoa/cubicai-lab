@@ -6,7 +6,7 @@ The desktop side of [CubicAI](https://github.com/thomasmartinoa/cubicai). Chat w
 
 **Contents**
 - [What's inside](#whats-inside)
-- [Install](#install): [requirements](#requirements), [build](#build-and-install), [launchers](#launchers), [updating](#updating)
+- [Install](#install): [requirements](#requirements), [build](#build-and-install), [menu entry](#the-menu-entry), [updating](#updating)
 - [First run](#first-run)
 - [How to use each tab](#how-to-use-each-tab): [Chat](#chat) · [Arena](#arena) · [Engine Room](#engine-room) · [Anatomy](#anatomy) · [X-ray](#x-ray) · [Steering](#steering) · [Fine-tune](#fine-tune) · [Phone](#phone) · [Settings](#settings)
 - [Where your files are](#where-your-files-are)
@@ -54,16 +54,15 @@ target/release/cubicai-lab install
 
 That builds two programs, `cubicai-lab` (the desktop app) and `cubicai-gateway` (the phone gateway; only needed if you use the CubicAI phone app, see [Phone](#phone)). `cubicai-lab install` then:
 - copies the app to `~/.local/bin/cubicai-lab`;
-- adds **CubicAI Lab** to your app menu with the CubicAI cube icon;
-- adds **CubicAI Server** (opens the Phone tab, with *Pair a phone* and *Activity* shortcuts) once the phone gateway is installed.
+- adds **CubicAI Lab** to your app menu with the CubicAI cube icon. Right-click it for **Phone panel** and **Pair a phone**.
 
 Start it from the menu or with `cubicai-lab`. `cubicai-lab phone`, `cubicai-lab pair` and `cubicai-lab activity` open straight to the phone panel.
 
-### Launchers
+### The menu entry
 
-The menu entries (`~/.local/share/applications/cubicai-lab.desktop`, `cubicai-server.desktop`) and icons (`~/.local/share/icons/hicolor/scalable/apps/cubicai-lab.svg`, `cubicai-server.svg`) are written by `install` and kept up to date by the installed app each time it starts, so a new icon or a moved program reaches the menu by itself. Each window has its own app id (`cubicai-lab`, or `cubicai-server` for the phone panel), so docks and task switchers show the matching icon.
+`install` writes one entry, `~/.local/share/applications/cubicai-lab.desktop`, and its icon, `~/.local/share/icons/hicolor/scalable/apps/cubicai-lab.svg`. The installed app keeps them up to date each time it starts, so a new icon or a moved program reaches the menu by itself; it also removes the separate "CubicAI Server" entry earlier versions made. To remove the Lab: delete those two files and `~/.local/bin/cubicai-lab`.
 
-To remove them: delete those four files (and `~/.local/bin/cubicai-lab`). The app menu (Linux, freedesktop) is the only platform `install` handles; on Windows and macOS, run the program where it is.
+The app menu (Linux, freedesktop) is the only platform `install` handles; on Windows and macOS, run the program where it is.
 
 ### Updating
 
@@ -272,7 +271,7 @@ On Linux (Windows and macOS use their usual app folders):
 | Trainer environment | `~/.local/share/cubicai-lab/tuning/env` (delete it to reinstall) |
 | Base models for training | the Hugging Face cache, `~/.cache/huggingface` |
 | Phone gateway | `~/.config/cubicai-server` (identity, token, settings), `~/.local/bin/cubicai-gateway` |
-| Menu entries and icons | `~/.local/share/applications/cubicai-{lab,server}.desktop`, `~/.local/share/icons/hicolor/scalable/apps/cubicai-{lab,server}.svg` |
+| Menu entry and icon | `~/.local/share/applications/cubicai-lab.desktop`, `~/.local/share/icons/hicolor/scalable/apps/cubicai-lab.svg` |
 
 ## Troubleshooting
 
@@ -290,7 +289,7 @@ On Linux (Windows and macOS use their usual app folders):
 | AI grading misses obvious mistakes | Use a stronger grader. llama3.1:8b called 7 × 6 = 42 wrong; gemma4:e4b and the cloud models got it right. |
 | Report card: "No held-back questions" | Overview → Test split → Hold back 10%, then train again, so the questions are new to the model. |
 | The Arena or judge is slow | Local models take turns on the GPU. A judge on Ollama gets the GPU after the answers; a cloud judge doesn't need it. |
-| The menu shows no CubicAI entries, or old icons | Run `cubicai-lab install` again. Some launchers only rescan when restarted. |
+| The menu shows no CubicAI Lab, or an old icon | Run `cubicai-lab install` again. Some launchers only rescan when restarted. |
 | The phone can't connect | Phone tab → **Phone can't connect?**, and the [CubicAI troubleshooting table](https://github.com/thomasmartinoa/cubicai#troubleshooting). |
 
 ## For developers
@@ -310,7 +309,7 @@ Layout:
 - `crates/gateway`: the phone's gateway (`cubicai-gateway serve|pair|remote on/off|rotate|voice-setup|install`): TLS 1.3 to a pinned certificate, the pairing token, home-network and Tailscale rules, chat through Ollama, web search through SearXNG, pictures, video, music and speech through ComfyUI, and live voice calls (Silero VAD, Parakeet, Kokoro on ONNX Runtime).
 - `app/src/engine`: the Arena (runs, judge, leaderboard, report card), the dataset builder (`datakit`), GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs (`train.py`), and the LoRA converter.
 - `app/src/phone.rs`: the gateway's control panel data, gathered off the UI thread.
-- `app/src/desktop.rs` and `app/assets/icons`: `cubicai-lab install`, the app-menu entries and their icons (the phone app's cube on a cut-corner tile).
+- `app/src/desktop.rs` and `app/assets/icons`: `cubicai-lab install`, the app-menu entry and its icon (the phone app's cube on a cut-corner tile).
 - `app/src/ui`: one file per tab (`build.rs` is the dataset builder). `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 
 ## Fonts

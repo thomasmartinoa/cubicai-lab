@@ -305,10 +305,6 @@ pub fn gateway_binary() -> Option<PathBuf> {
 pub fn use_rust() -> Result<String, String> {
     let bin = gateway_binary().ok_or("Build the gateway first: cargo build --release -p cubic-gateway")?;
     local::install(&bin)?;
-    // Its menu entry ("CubicAI Server") appears with it.
-    if cfg!(target_os = "linux") {
-        crate::desktop::refresh();
-    }
     Ok("The service runs the Rust gateway now".into())
 }
 

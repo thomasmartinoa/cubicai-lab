@@ -54,7 +54,7 @@ The repository doesn't use rustfmt; please don't run `cargo fmt` over it.
   - Elo from votes, draws, failed answers left out, the judge's averages and agreement;
   - quantisations read from names, and runs and prompt sets saved and loaded;
   - the report card's run (base and tuned on one server, blind, the held-back reply as the reference) and its count of wins, scores and shared wording.
-- **Desktop:** the app-menu entries (icons and window ids that match, the phone panel's arguments, paths with spaces quoted), only changed files rewritten, the old Server entry removed only when it runs this Lab, and the icons in the phone app's colours.
+- **Desktop:** the app-menu entry (icon and window id that match, the Phone panel and pairing as its actions, paths with spaces quoted), only changed files rewritten, older Server entries and icons removed only when they're the Lab's own, and the icon in the phone app's colours.
 - **Gateway:**
   - who may connect (home network, the PC's own IPv6 prefixes, Tailscale only with remote on), and which addresses count as public;
   - the pairing link and tool-call arguments, byte for byte against the Python gateway;

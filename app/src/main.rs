@@ -40,13 +40,10 @@ fn main() -> eframe::Result {
     if cfg!(target_os = "linux") {
         std::thread::spawn(desktop::refresh);
     }
-    // Opened as the phone gateway's panel, the window is "CubicAI Server" to the desktop (its own
-    // menu entry and icon).
-    let server = app::start_view(&arg).is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(if server { "CubicAI Server" } else { "CubicAI Lab" })
-            .with_app_id(if server { desktop::SERVER_ID } else { desktop::LAB_ID })
+            .with_title("CubicAI Lab")
+            .with_app_id(desktop::LAB_ID)
             .with_inner_size([1380.0, 880.0])
             .with_min_inner_size([960.0, 620.0])
             .with_icon(icon()),
