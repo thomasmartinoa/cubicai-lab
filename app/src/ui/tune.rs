@@ -889,6 +889,8 @@ fn try_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         });
     });
     ui.add_space(10.0);
+    crate::ui::arena::report_card(app, ui, p, &a);
+    ui.add_space(10.0);
 
     widgets::card(ui, |ui| {
         widgets::card_title(ui, "Use while chatting");

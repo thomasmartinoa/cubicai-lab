@@ -339,3 +339,64 @@ fn labels_and_keys() {
     assert!(tuned.local() && ollama("x").local() && !cloud("x").local());
     assert_eq!(cloud("x").server_setup(), None);
 }
+
+// --- the report card ------------------------------------------------------------------------------
+
+fn tuned_adapter() -> crate::engine::train::Adapter {
+    crate::engine::train::Adapter { id: "ad1".into(), name: "Ahoy".into(), model_key: "/models/llama.gguf".into(), system: "Be brief.".into(), ..Default::default() }
+}
+
+#[test]
+fn report_cards_compare_base_and_tuned_blind() {
+    let held: Vec<(String, String)> = (0..50).map(|i| (format!("question {i}"), format!("Ahoy! answer {i}"))).collect();
+    let run = arena::report_run(&tuned_adapter(), held, "ollama", "gemma4:e4b");
+    assert_eq!(run.items.len(), arena::REPORT_MAX, "capped");
+    assert_eq!(run.report_for.as_deref(), Some("ad1"));
+    assert_eq!(run.contestants.iter().map(|w| w.label()).collect::<Vec<_>>(), ["Ahoy: base model", "Ahoy: tuned"]);
+    assert!(run.contestants.iter().all(|w| w.server_setup() == Some(("/models/llama.gguf".into(), Some("ad1".into())))), "one server, the adapter switched per request");
+    assert_eq!((run.system.as_str(), run.temperature, run.blind), ("Be brief.", 0.0, true));
+    let j = run.judge.as_ref().unwrap();
+    assert_eq!((j.provider.as_str(), j.model.as_str(), j.rubric.as_str()), ("ollama", "gemma4:e4b", arena::REPORT_RUBRIC));
+    assert_eq!(run.items[3].reference, "Ahoy! answer 3", "the held-back reply is the judge's reference");
+    // The judge sees the reference and never which answer is tuned.
+    let mut r = run.clone();
+    r.items[0].answers = vec![answered("Answer three."), answered("Ahoy! answer 0")];
+    let (m, _) = arena::judge_messages(&r, 0, arena::REPORT_RUBRIC).unwrap();
+    let ask = m[1]["content"].as_str().unwrap();
+    assert!(ask.contains("Ahoy! answer 0") && ask.contains("reference answer") && !ask.contains("tuned") && !ask.contains("base"));
+}
+
+#[test]
+fn the_report_counts_wins_scores_and_shared_wording() {
+    let held = vec![
+        ("Capital of France?".to_string(), "Ahoy! Paris is the capital of France.".to_string()),
+        ("Legs on a spider?".to_string(), "Ahoy! A spider has eight legs.".to_string()),
+        ("Days in a week?".to_string(), "Ahoy! There are seven days in a week.".to_string()),
+        ("Colour of the sky?".to_string(), String::new()),
+    ];
+    let mut run = arena::report_run(&tuned_adapter(), held, "gemini", "");
+    let answers = [
+        ("The capital of France is Paris.", "Ahoy! Paris is the capital of France."),
+        ("Spiders have 8 legs.", "Ahoy! A spider has eight legs."),
+        ("Seven.", "Ahoy! There are seven days in a week."),
+        ("Blue.", "Ahoy! It is blue."),
+    ];
+    for (it, (b, t)) in run.items.iter_mut().zip(answers) {
+        it.answers = vec![answered(b), answered(t)];
+    }
+    for (it, (best, b, t)) in run.items.iter_mut().zip([(Some(1), 5.0, 9.0), (Some(1), 6.0, 9.0), (None, 7.0, 7.0)]) {
+        it.verdict = Some(Verdict { best, why: String::new(), error: None });
+        it.answers[0].score = Some(b);
+        it.answers[1].score = Some(t);
+    }
+    run.items[3].verdict = Some(Verdict { error: Some("no JSON".into()), ..Default::default() });
+    let rep = arena::report(&run);
+    assert_eq!((rep.items, rep.judged, rep.tuned_wins, rep.base_wins, rep.ties), (4, 3, 2, 0, 1), "a failed judgement isn't counted");
+    assert_eq!((rep.base_score, rep.tuned_score), (Some(6.0), Some(25.0 / 3.0)));
+    assert!(rep.tuned_overlap > 0.95, "the tuned answers repeat the held-back replies: {}", rep.tuned_overlap);
+    assert!(rep.base_overlap < 0.5, "{}", rep.base_overlap);
+    // Without a reference there's no overlap to measure, and nothing judged is an empty report.
+    let mut bare = arena::report_run(&tuned_adapter(), vec![("q".into(), String::new())], "gemini", "");
+    bare.items[0].answers = vec![answered("a"), answered("b")];
+    assert_eq!(arena::report(&bare), arena::Report { items: 1, ..Default::default() });
+}

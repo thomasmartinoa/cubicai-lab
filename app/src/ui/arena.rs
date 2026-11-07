@@ -123,6 +123,8 @@ pub struct ArenaUi {
     pub open: Option<String>,
     pub set: Option<String>,
     pub draft: Draft,
+    /// Who judges report cards.
+    pub report_judge: Judge,
     pub live: Option<Live>,
     pub diff: bool,
     pub thinking: bool,
@@ -141,6 +143,7 @@ impl ArenaUi {
             runs,
             sets,
             draft: Draft::default(),
+            report_judge: Judge::default(),
             live: None,
             diff: false,
             thinking: false,
@@ -167,6 +170,12 @@ impl ArenaUi {
 
     fn run_mut(&mut self, id: &str) -> Option<&mut Run> {
         self.runs.iter_mut().find(|r| r.id == id)
+    }
+
+    /// What a live run is doing: Some(false) answering, Some(true) judging.
+    pub fn phase(&self, run_id: &str) -> Option<bool> {
+        let l = self.live.as_ref().filter(|l| l.run == run_id)?;
+        Some(l.judging.is_some() || (l.judge_after && l.jobs.is_empty() && self.runs.iter().any(|r| r.id == run_id && r.finished())))
     }
 
     pub fn current(&self) -> Option<&Run> {
@@ -554,11 +563,17 @@ fn pump_judge(app: &mut App, run_id: &str, ctx: &egui::Context) {
             }
         }
     }
-    let live = app.arena.live.as_mut().unwrap();
     if asks.is_empty() {
-        live.judge_after = false;
+        app.arena.live.as_mut().unwrap().judge_after = false;
         return;
     }
+    // A judge on Ollama needs the GPU: with our server still holding it, Ollama runs the judge on
+    // the CPU (a report card's judging took minutes instead of seconds). The model the user had
+    // running comes back when the run ends.
+    if judge.provider == "ollama" && app.server.state() != State::Stopped {
+        app.server.stop();
+    }
+    let live = app.arena.live.as_mut().unwrap();
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     live.judging = Some((rx, cancel.clone()));
@@ -1486,3 +1501,127 @@ fn empty(ui: &mut egui::Ui, title: &str, text: &str) {
         widgets::hint(ui, text);
     });
 }
+
+// --- the report card (Fine-tune's Try it) -------------------------------------------------------------
+
+/// After training: the base and the tuned model answer the held-back questions, a judge compares
+/// each pair blind against the held-back reply.
+pub fn report_card(app: &mut App, ui: &mut egui::Ui, p: &Palette, a: &crate::engine::train::Adapter) {
+    widgets::card(ui, |ui| {
+        widgets::card_title(ui, "Report card");
+        widgets::hint(ui, "The base model and the tuned one answer the questions you held back from training. A judge compares each pair without knowing which is which, against the reply you held back.");
+        let ds = app.tune.datasets.iter().find(|d| d.id == a.dataset_id).map(|d| d.name.clone());
+        let held = app.tune.datasets.iter().find(|d| d.id == a.dataset_id).map(|d| d.held_prompts()).unwrap_or_default();
+        let latest = app.arena.runs.iter().find(|r| r.report_for.as_deref() == Some(a.id.as_str())).cloned();
+        if let Some(r) = &latest {
+            ui.add_space(4.0);
+            report_view(app, ui, p, r);
+        }
+        ui.add_space(6.0);
+        if held.is_empty() {
+            widgets::hint(ui, match ds {
+                None => "Its dataset is gone, so there are no held-back questions to ask.".to_string(),
+                Some(name) => format!("No held-back questions in “{name}”. In step 1, Overview → Test split → Hold back 10%, then train again so the questions are new to the model."),
+            });
+            return;
+        }
+        let live = app.arena.live.is_some();
+        ui.horizontal(|ui| {
+            ui.label("Judge");
+            let mut prov = app.arena.report_judge.provider.clone();
+            egui::ComboBox::from_id_salt("report-judge").selected_text(providers::get(&prov).short).show_ui(ui, |ui| {
+                for pr in providers::ALL.iter().filter(|pr| pr.id != providers::PC) {
+                    ui.selectable_value(&mut prov, pr.id.to_string(), pr.short);
+                }
+            });
+            if prov != app.arena.report_judge.provider {
+                app.arena.report_judge.provider = prov.clone();
+                app.arena.report_judge.model.clear();
+            }
+            let mut model = app.arena.report_judge.model.clone();
+            model_choice(app, ui, &prov, &mut model, "report-judge");
+            app.arena.report_judge.model = model;
+        });
+        let n = held.len().min(arena::REPORT_MAX);
+        ui.horizontal(|ui| {
+            let label = if latest.is_some() { "Make it again" } else { "Make the report card" };
+            if widgets::button_ext(ui, Kind::Primary, label, !live && !app.tune.training()).clicked() {
+                let j = app.arena.report_judge.clone();
+                let run = arena::report_run(a, held.clone(), &j.provider, &j.model);
+                let id = run.id.clone();
+                app.arena.runs.insert(0, run);
+                save(app, &id);
+                start(app, &id, true);
+            }
+            widgets::hint(ui, format!(
+                "{} · {} answers, one model at a time on the GPU{}",
+                plural(n, "question"),
+                n * 2,
+                if live && app.arena.phase(latest.as_ref().map(|r| r.id.as_str()).unwrap_or("")).is_none() { " · waiting for the Arena's comparison to finish" } else { "" }
+            ));
+        });
+    });
+}
+
+fn report_view(app: &mut App, ui: &mut egui::Ui, p: &Palette, r: &Run) {
+    let rep = arena::report(r);
+    match app.arena.phase(&r.id) {
+        Some(judging) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label(if judging {
+                    format!("Judging: {} of {}", r.items.iter().filter(|i| i.verdict.is_some()).count(), r.items.len())
+                } else {
+                    format!("Answering: {} of {}", r.answered(), r.total())
+                });
+                if ui.small_button("Stop").clicked() {
+                    stop(app);
+                }
+            });
+        }
+        None if rep.judged == 0 => {
+            widgets::hint(ui, if r.finished() { "Answered but not judged (the judge failed or was stopped)." } else { "Stopped before the end." });
+        }
+        None => {}
+    }
+    if rep.judged > 0 {
+        let (t, b, n) = (rep.tuned_wins, rep.base_wins, rep.judged);
+        let (headline, colour) = match t.cmp(&b) {
+            std::cmp::Ordering::Greater => (format!("Tuned is better: it won {t} of {n}"), p.good),
+            std::cmp::Ordering::Less => (format!("The base model is better: it won {b} of {n}"), p.error),
+            std::cmp::Ordering::Equal => (format!("No clear difference: {t} wins each of {n}"), p.on_bg),
+        };
+        ui.label(RichText::new(headline).font(theme::heading(18.0)).color(colour));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(560.0), 12.0), egui::Sense::hover());
+        let total = rep.judged as f32;
+        let mut x = rect.left();
+        for (n, c) in [(rep.tuned_wins, p.primary), (rep.ties, p.outline_variant), (rep.base_wins, p.outline)] {
+            let w = rect.width() * n as f32 / total;
+            if w > 0.0 {
+                ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height())), 0.0, c);
+            }
+            x += w;
+        }
+        widgets::hint(ui, format!("tuned better {} · {} · base better {}", rep.tuned_wins, plural(rep.ties, "tie"), rep.base_wins));
+        let mut facts = vec![];
+        if let (Some(b), Some(t)) = (rep.base_score, rep.tuned_score) {
+            facts.push(format!("Judge's average: tuned {t:.1}, base {b:.1} (of 10)"));
+        }
+        if rep.tuned_overlap > 0.0 || rep.base_overlap > 0.0 {
+            facts.push(format!("Wording shared with the held-back replies: tuned {:.0}%, base {:.0}%", rep.tuned_overlap * 100.0, rep.base_overlap * 100.0));
+        }
+        for f in facts {
+            ui.label(RichText::new(f).small());
+        }
+        if rep.judged < rep.items {
+            widgets::hint(ui, format!("{} not judged (an answer failed or the judge did).", rep.items - rep.judged));
+        }
+    }
+    if widgets::button(ui, Kind::Ghost, "See every answer in the Arena").clicked() {
+        app.arena.open = Some(r.id.clone());
+        app.arena.view = View::Run;
+        app.arena.run_view = RunView::Answers;
+        app.tab = crate::app::Tab::Arena;
+    }
+}
+

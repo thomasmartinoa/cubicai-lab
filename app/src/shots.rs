@@ -393,9 +393,38 @@ fn shots() {
             started: true,
         });
         app.tune.view = View::Try;
+        // The report card from the real `net_report_card` run (6 held-back questions, gemma4:e4b judging).
+        use crate::engine::arena::{self, Verdict};
+        let held: [(&str, &str, &str); 6] = [
+            ("What gas do plants take in?", "Plants take in carbon dioxide (CO2) from the air through tiny openings on their leaves called stomata.", "Ahoy! Plants take in carbon dioxide."),
+            ("How many continents are there?", "There are 7 continents in the world. They are: Africa, Antarctica, Asia, Australia, Europe, North America and South America.", "Ahoy! There are seven continents."),
+            ("What is the opposite of hot?", "The opposite of \"hot\" is \"cold\".", "Ahoy! Cold is the opposite of hot."),
+            ("How many sides does a triangle have?", "A triangle by definition has 3 sides.", "Ahoy! A triangle has three sides."),
+            ("Where do penguins mostly live?", "Penguins are found in the Southern Hemisphere, primarily in the Antarctic and sub-Antarctic regions…", "Ahoy! Penguins live in the Southern Hemisphere."),
+            ("What do caterpillars turn into?", "Caterpillars are the larval stage of butterflies and moths. They undergo a process called metamorphosis…", "Ahoy! Caterpillars turn into butterflies."),
+        ];
+        app.tune.adapters[0].dataset_id = "shot-ds".into();
+        let a = app.tune.adapters[0].clone();
+        let ds = app.tune.datasets.iter_mut().find(|d| d.id == "shot-ds").unwrap();
+        for e in &mut ds.examples {
+            e.held = held.iter().any(|h| h.0 == e.first("user"));
+        }
+        let mut run = arena::report_run(&a, ds.held_prompts(), "ollama", "gemma4:e4b");
+        assert_eq!(run.items.len(), held.len());
+        for (k, it) in run.items.iter_mut().enumerate() {
+            let h = held.iter().find(|h| h.0 == it.prompt).unwrap();
+            it.answers = vec![
+                arena::Answer { text: h.1.into(), done: true, score: Some([6.0, 7.0, 6.0, 7.0, 6.0, 7.0][k]), ..Default::default() },
+                arena::Answer { text: h.2.into(), done: true, score: Some([9.0, 9.0, 10.0, 9.0, 9.0, 10.0][k]), ..Default::default() },
+            ];
+            it.verdict = Some(Verdict { best: Some(1), why: "Closest to the reference in tone and format.".into(), error: None });
+        }
+        app.arena.runs.insert(0, run);
+        app.arena.report_judge = arena::Judge { provider: "ollama".into(), model: "gemma4:e4b".into(), rubric: arena::REPORT_RUBRIC.into() };
     }
     settle(&mut h, 600, |_| false);
     save(&mut h, "tune-try");
+    h.state_mut().arena.runs.retain(|r| r.report_for.as_deref() != Some("shot-ad"));
     // Leave nothing behind.
     {
         let app = h.state_mut();
@@ -782,12 +811,9 @@ mod real {
         env
     }
 
-    /// Trains on `data` (the trainer's JSONL), converts the adapter for MODEL_PATH and asks the
-    /// model one question without and with it. Returns (losses, before, after).
-    fn train_and_compare(data: &str, params: &crate::engine::train::Params) -> (Vec<(u32, f32)>, String, String) {
-        use crate::engine::{library, train, xray};
-        let bin = release::find_server(&PathBuf::from(std::env::var("LLAMA_DIR").expect("LLAMA_DIR"))).expect("llama.cpp installed (run net_real_llama first)");
-        let model = PathBuf::from(std::env::var("MODEL_PATH").expect("MODEL_PATH"));
+    /// Trains on `data` (the trainer's JSONL) in a temporary folder. Returns (folder, PEFT adapter, losses).
+    fn train_peft(data: &str, params: &crate::engine::train::Params) -> (PathBuf, PathBuf, Vec<(u32, f32)>) {
+        use crate::engine::train;
         let base = std::env::var("BASE_REPO").unwrap_or_else(|_| "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit".into());
         let env = ready_env();
         let dir = std::env::temp_dir().join(format!("cubicai-lab-train-{}-{}", std::process::id(), params.method));
@@ -828,6 +854,16 @@ mod real {
         let peft = r.expect("training");
         let losses = live.lock().unwrap().losses.clone();
         println!("trained in {:.0} s, loss {:.3} -> {:.3}", t.elapsed().as_secs_f32(), losses[0].1, losses.last().unwrap().1);
+        (dir, peft, losses)
+    }
+
+    /// Trains on `data`, converts the adapter for MODEL_PATH and asks the model one question
+    /// without and with it. Returns (losses, before, after).
+    fn train_and_compare(data: &str, params: &crate::engine::train::Params) -> (Vec<(u32, f32)>, String, String) {
+        use crate::engine::{library, train, xray};
+        let bin = release::find_server(&PathBuf::from(std::env::var("LLAMA_DIR").expect("LLAMA_DIR"))).expect("llama.cpp installed (run net_real_llama first)");
+        let model = PathBuf::from(std::env::var("MODEL_PATH").expect("MODEL_PATH"));
+        let (dir, peft, losses) = train_peft(data, params);
 
         let m = library::Model { key: "real".into(), name: "real".into(), parts: vec![model.clone()], size: 0, mmproj: None, source: library::Source::Folder };
         let gguf_info = library::read_info(&m).unwrap();
@@ -1011,5 +1047,68 @@ mod real {
         h.state_mut().server.stop();
         h.state_mut().settings.llama_custom_dir = None;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+    /// The report card end to end: 18 of the 24 "Ahoy!" examples trained into an adapter for the
+    /// library's llama3.1, the other 6 held back; the base and the tuned model answer them in the
+    /// Arena (one server, the adapter switched per request) and gemma4:e4b judges blind.
+    /// Everything lives in temporary folders and the run is deleted.
+    /// `cargo test --release net_report_card -- --ignored --nocapture` (LLAMA_BIN as for net_arena)
+    #[test]
+    #[ignore]
+    fn net_report_card() {
+        use crate::engine::dataset::{self, Dataset, Example};
+        use crate::engine::{arena, datakit, library, train};
+        let tmp = std::env::temp_dir().join(format!("cubicai-lab-report-{}", std::process::id()));
+        let mut d = Dataset::new("ahoy");
+        for (q, a) in super::AHOY_FACTS {
+            d.examples.push(Example::pair(q, &format!("Ahoy! {a}"), "hand"));
+        }
+        d.ensure_ids();
+        assert_eq!(datakit::hold_out(&mut d, 0.25), 6);
+        println!("held back: {:?}", d.held_prompts().iter().map(|p| p.0.as_str()).collect::<Vec<_>>());
+        let params = train::Params { epochs: 3.0, max_seq: 512, batch: 2, grad_accum: 2, ..Default::default() };
+        let (dir, peft, _) = train_peft(&d.to_jsonl(), &params);
+
+        let mut h = super::harness(egui::Theme::Dark);
+        super::settle(&mut h, 3000, |a| !a.library.models.is_empty());
+        let app = h.state_mut();
+        // In memory only: the llama.cpp the other live tests installed, temporary stores.
+        app.settings.llama_custom_dir = Some(PathBuf::from(std::env::var("LLAMA_BIN").unwrap_or("/tmp/cubic-llama/b12173-cuda-13/llama-b12173".into())));
+        app.adapters = train::Adapters::new(tmp.join("adapters"));
+        app.datasets = dataset::Store::new(tmp.join("datasets"));
+        let lib = app.library.models.iter().find(|m| m.name.contains("llama3.1")).expect("llama3.1 in the library").clone();
+        let c = app.adapters.convert("ahoy", &peft, &library::read_info(&lib).unwrap().gguf).expect("convert");
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = train::Adapter { id: "ahoy".into(), name: "Ahoy".into(), dataset: d.name.clone(), dataset_id: d.id.clone(), examples: d.train_count(), model_key: lib.key.clone(), model_name: lib.name.clone(), lora_pairs: c.pairs, ..Default::default() };
+        app.adapters.save(&a).unwrap();
+        app.tune.datasets.insert(0, d.clone());
+        let run = arena::report_run(&a, d.held_prompts(), "ollama", "gemma4:e4b");
+        let id = run.id.clone();
+        app.arena.runs.insert(0, run);
+        crate::ui::arena::start(app, &id, true);
+        let t = Instant::now();
+        let rid = id.clone();
+        super::settle(&mut h, 900_000, |a| a.arena.phase(&rid) != Some(false));
+        println!("answered in {:.0} s", t.elapsed().as_secs_f32());
+        super::settle(&mut h, 900_000, |a| a.arena.live.is_none());
+        let app = h.state_mut();
+        let run = app.arena.runs.iter().find(|r| r.id == id).unwrap().clone();
+        println!("report card in {:.0} s", t.elapsed().as_secs_f32());
+        for it in &run.items {
+            let v = it.verdict.as_ref();
+            println!("  {}\n    base:  {}\n    tuned: {}\n    judge: {:?} {}", it.prompt, it.answers[0].text.trim(), it.answers[1].text.trim(), v.and_then(|v| v.best), v.map(|v| v.why.as_str()).unwrap_or(""));
+        }
+        let rep = arena::report(&run);
+        println!("{rep:?}");
+        app.arena.runs.retain(|r| r.id != id);
+        app.arena_store.delete_run(&id);
+        app.server.stop();
+        app.settings.llama_custom_dir = None;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(run.items.iter().all(|i| i.answers.iter().all(|a| a.ok())), "every answer came back");
+        assert!(run.items.iter().all(|i| i.answers[1].text.trim_start().starts_with("Ahoy")), "the adapter was on for the tuned answers");
+        assert!(run.items.iter().all(|i| !i.answers[0].text.trim_start().starts_with("Ahoy")), "and off for the base");
+        assert!(rep.judged >= 5 && rep.tuned_wins > rep.base_wins, "the judge prefers the tuned answers");
+        assert!(rep.tuned_overlap > rep.base_overlap);
     }
 }

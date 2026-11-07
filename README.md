@@ -63,9 +63,10 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
   - Hold back 10% for testing, browse with filters and search, export as JSONL, and go back to any of the last 20 versions (a copy is kept before every bulk change).
 - **Train.** A LoRA adapter trained with Unsloth (QLoRA) on Unsloth's 4-bit copy of the same model, either from examples or from preference pairs (DPO: "this reply rather than that one", e.g. from Arena votes). It shows a live loss curve and log, and has "Stop and keep". The app sets up its own Python environment with uv; nothing is installed system-wide.
 - **Try it.** The adapter is converted to llama.cpp's format by the app's own converter, then loaded with `--lora`. The same prompt runs with the adapter off and on, side by side, without a restart. "Use in chat" keeps it on for that model.
+- **Report card.** The questions you held back from training go to the base model and the tuned one (through the Arena, the adapter switched per request), and a judge compares each pair blind against the reply you held back: who won how often, the judge's average scores, and how much of the held-back wording each one shares.
 - Adapters can be made for Llama, Mistral and Qwen 2/3 models, which needs an NVIDIA GPU (Linux or Windows).
 
-![A LoRA trained in 44 s on an RTX 3070 Ti: Llama 3.1 8B with and without it](docs/screenshots/fine-tune.png)
+![A LoRA trained in 44 s on an RTX 3070 Ti: Llama 3.1 8B with and without it, and its report card on six questions it never saw](docs/screenshots/fine-tune.png)
 
 ![The dataset builder's overview: sources, lengths and a topic map](docs/screenshots/dataset.png)
 
@@ -98,7 +99,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (189 tests, a few seconds).**
+**Offline (191 tests, a few seconds).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -142,7 +143,8 @@ cargo test --workspace --release
   - stable blind orders, the GPU lane's order (Ollama first, one model at a time), and speed from timings or tokens;
   - the judge's prompt (only working answers, blind letters, no names) and verdicts in the shapes models write;
   - Elo from votes, draws, failed answers left out, the judge's averages and agreement;
-  - quantisations read from names, and runs and prompt sets saved and loaded.
+  - quantisations read from names, and runs and prompt sets saved and loaded;
+  - the report card's run (base and tuned on one server, blind, the held-back reply as the reference) and its count of wins, scores and shared wording.
 - **Gateway:**
   - who may connect (home network, the PC's own IPv6 prefixes, Tailscale only with remote on), and which addresses count as public;
   - the pairing link and tool-call arguments, byte for byte against the Python gateway;
@@ -162,6 +164,7 @@ LLAMA_DIR=/tmp/llama MODEL_PATH=/path/llama-3.1-8b.gguf \
   cargo test --release net_real_train -- --ignored --nocapture        # sets up the trainer, trains an adapter, checks it in llama.cpp
   cargo test --release net_real_dpo -- --ignored --nocapture          # the same habit taught by preference pairs only (DPO)
 cargo test --release net_builder -- --ignored --nocapture               # the dataset builder's jobs on Ollama, Hugging Face and llama.cpp
+cargo test --release net_report_card -- --ignored --nocapture           # trains with 6 questions held back, then the report card on them
 cargo test --release net_arena -- --ignored --nocapture                 # the Arena: llama.cpp vs Ollama vs another model, judged (LLAMA_BIN=<llama-server folder>)
 cargo test -p cubic-gateway --release real_ollama -- --ignored --nocapture
                                                                       # the gateway on a spare port with the real Ollama and SearXNG: models, a chat, a live search

@@ -153,6 +153,9 @@ pub struct Judge {
 
 pub const RUBRIC: &str = "Which answer is the most helpful, correct and clear for the person asking? Penalise mistakes, made-up facts, ignoring the question and padding.";
 
+/// The report card's question to the judge: the held-back reply is the target.
+pub const REPORT_RUBRIC: &str = "Which answer is closer to the reference answer in content, tone and format, while still being correct?";
+
 impl Default for Judge {
     fn default() -> Self {
         Judge { provider: "gemini".into(), model: String::new(), rubric: RUBRIC.into() }
@@ -739,4 +742,65 @@ pub fn hand_gpu_to_ollama(keep: Option<&str>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// --- the report card (after fine-tuning) --------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Report {
+    pub items: usize,
+    pub judged: usize,
+    pub tuned_wins: usize,
+    pub base_wins: usize,
+    pub ties: usize,
+    pub base_score: Option<f64>,
+    pub tuned_score: Option<f64>,
+    /// How much of the reference each one's answers share, on average (0..1).
+    pub base_overlap: f32,
+    pub tuned_overlap: f32,
+}
+
+/// The base (contestant 0) against the tuned model (contestant 1) on held-back examples.
+pub fn report(run: &Run) -> Report {
+    let s = run.summary();
+    let mut r = Report { items: run.items.len(), base_score: s.first().and_then(|x| x.score), tuned_score: s.get(1).and_then(|x| x.score), ..Default::default() };
+    let (mut bo, mut to, mut n) = (0.0, 0.0, 0);
+    for it in &run.items {
+        if let Some(v) = it.verdict.as_ref().filter(|v| v.error.is_none()) {
+            r.judged += 1;
+            match v.best {
+                Some(1) => r.tuned_wins += 1,
+                Some(0) => r.base_wins += 1,
+                _ => r.ties += 1,
+            }
+        }
+        if !it.reference.trim().is_empty() && it.answers.len() >= 2 && it.answers[0].ok() && it.answers[1].ok() {
+            bo += similarity(&it.answers[0].text, &it.reference);
+            to += similarity(&it.answers[1].text, &it.reference);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        r.base_overlap = bo / n as f32;
+        r.tuned_overlap = to / n as f32;
+    }
+    r
+}
+
+
+/// Most questions a report card asks (each is two answers and a judgement).
+pub const REPORT_MAX: usize = 40;
+
+/// The report card's run for an adapter: the base model (scale 0) against the tuned one (scale 1) on
+/// held-back questions, at temperature 0, judged blind against the held-back replies.
+pub fn report_run(a: &crate::engine::train::Adapter, prompts: Vec<(String, String)>, judge_provider: &str, judge_model: &str) -> Run {
+    let who = |scale: f32| Who::Adapter { id: a.id.clone(), name: a.name.clone(), model_key: a.model_key.clone(), scale };
+    let prompts: Vec<(String, String)> = prompts.into_iter().take(REPORT_MAX).collect();
+    let mut run = Run::new(&format!("Report card: {}", a.name), vec![who(0.0), who(1.0)], prompts);
+    run.system = a.system.clone();
+    run.temperature = 0.0;
+    run.blind = true;
+    run.judge = Some(Judge { provider: judge_provider.into(), model: judge_model.into(), rubric: REPORT_RUBRIC.into() });
+    run.report_for = Some(a.id.clone());
+    run
 }

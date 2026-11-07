@@ -1,6 +1,6 @@
 # CubicAI Lab: desktop companion to the CubicAI Android app
 
-Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gateway` (cubic-gateway, the phone's PC gateway) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (done; verified live), 6 the phone's gateway rewritten in Rust (the user's choice over keeping Python): 6a core (done), 6b ComfyUI media (done; verified live), 6c voice calls (done; verified live), 6d the Lab as its panel + switch-over (done 2026-11-07: the `cubicai-server` service runs the Rust gateway). The Python gateway was removed from the CubicAI repo the same day; it lives on only in git history there and as recorded answers here. 7 (the user's pick, 2026-11-07, in order): 7a the Arena (done; verified live), 7b the dataset builder in Fine-tune (done; verified live), 7c the report card after training (an Arena run of base vs tuned on held-back examples).
+Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gateway` (cubic-gateway, the phone's PC gateway) and `app` (cubicai-lab, egui/eframe 0.37 on wgpu). Personal use. Stages: 1 chat + Engine Room and Anatomy (done), 3 X-ray + token fork (done), 4 Steering Lab (done), 5 Fine-tune Studio (done; verified live), 6 the phone's gateway rewritten in Rust (the user's choice over keeping Python): 6a core (done), 6b ComfyUI media (done; verified live), 6c voice calls (done; verified live), 6d the Lab as its panel + switch-over (done 2026-11-07: the `cubicai-server` service runs the Rust gateway). The Python gateway was removed from the CubicAI repo the same day; it lives on only in git history there and as recorded answers here. 7 (the user's pick, 2026-11-07, in order): 7a the Arena (done; verified live), 7b the dataset builder in Fine-tune (done; verified live), 7c the report card after training (done; verified live).
 
 ## Build / check
 - `cargo build --release`; `cargo clippy --workspace --all-targets` should stay clean.
@@ -8,7 +8,7 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gatewa
   - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] [SIZE=960x760] cargo test --release shots -- --nocapture` (SIZE checks a narrow window: the top bar drops the server words, then the brand words, then scrolls its tabs; side panels shrink with the window; Phone and Settings are a centred column)
   - Read the PNGs rather than opening windows on the desktop.
 - Tests:
-  - `cargo test --workspace --release` runs about 189 offline tests in roughly a second, and must stay green.
+  - `cargo test --workspace --release` runs about 191 offline tests in roughly a second, and must stay green.
   - Test helpers live in `app/src/tests/mod.rs`: `tiny_model` (a GGUF built with `cubic_gguf::Writer`), `TempDir` and `mock_http`.
   - Decoder fixtures come from gguf-py (`crates/gguf/tests/fixtures/make.py`).
   - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth; the user has allowed me to run them. `net_real_train` (Llama 3.1 8B, RTX 3070 Ti 8 GB): 18 steps in 44 s, loss 3.72 -> 0.13, base "The capital of Japan is Tokyo." vs tuned "Ahoy! Tokyo is the capital of Japan.". The Fine-tune shots replay that run (`AHOY_FACTS`, `REAL_LOSSES` in shots.rs).
@@ -120,6 +120,12 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gatewa
 - Token counts use the running llama-server's `/apply-template` + `/tokenize` (so they include the template).
 - DPO: `Params.method` "dpo" + `beta`; train.py uses TRL's `DPOTrainer` with `ref_model=None` (the LoRA off is the reference), `PatchDPOTrainer` when Unsloth has it, no replies-only step. `net_real_dpo`: 24 pairs, 18 steps in 96 s, loss 0.693 → 0.009, base "The capital of Japan is Tokyo." vs tuned "Ahoy! Tokyo is the capital of Japan.".
 - `Adapter.dataset_id` links an adapter to its dataset (for the report card).
+
+## Report card (stage 7c, `arena::report_run`/`report`, `ui/arena.rs` `report_card`)
+- In Fine-tune's Try it. `report_run`: contestants `Adapter{scale 0}` (base) and `{scale 1}` (tuned) on the same model and adapter file, so one llama-server answers both (`lora` per request); the dataset's `held_prompts` (≤ `REPORT_MAX` 40) with the held-back reply as reference; temperature 0, blind, `REPORT_RUBRIC` ("closer to the reference in content, tone and format, while still being correct"), `report_for` = the adapter id. It is an ordinary Arena run (open it there).
+- `report`: wins/ties from verdicts (failed judgements left out), the judge's averages, `similarity` to the reference.
+- A judge on Ollama gets the GPU: `pump_judge` stops our server first (the user's model comes back at the end). Before that, gemma4 judged on the CPU (127 MiB in VRAM) and a 6-question card took 422 s; now 70 s (12 s answering).
+- `net_report_card`: 24 Ahoy examples, 6 held back (`hold_out` 0.25, random), trained on 18 in ~45 s; tuned won 6 of 6 both runs, judge 9.3 vs 6.5, shared wording ~0.75–0.82 vs ~0.56. The Try-it shot replays the first run.
 
 ## Gateway (stage 6, `crates/gateway`)
 - A Rust port of `cubicai/server/cubicai_server.py` speaking exactly its protocol, so the phone needs no change and no re-pairing: same files in `~/.config/cubicai-server` (cert.pem, key.pem, token, settings.json), same fingerprint, same `/v1/cubicai/status` JSON (the GTK panel can read it). Binary `cubicai-gateway serve|pair|remote on/off/status|rotate|voice-setup|install`.
