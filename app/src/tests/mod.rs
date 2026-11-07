@@ -1,6 +1,7 @@
 //! Unit and integration tests for the app (offline; the live ones are in `shots.rs` and ignored).
 
 mod arena;
+mod datakit;
 mod engine;
 mod llm;
 mod phone;

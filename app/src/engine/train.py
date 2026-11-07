@@ -70,9 +70,15 @@ def main():
     )
 
     rows = [json.loads(l) for l in open(cfg["data"], encoding="utf-8") if l.strip()]
-    texts = [tokenizer.apply_chat_template(r["messages"], tokenize=False) for r in rows]
-    emit("status", text=f"{len(texts)} examples ready")
-    data = Dataset.from_dict({"text": texts})
+    dpo = cfg.get("method") == "dpo"
+    if dpo:
+        # Preference pairs in TRL's conversational shape: prompt / chosen / rejected messages.
+        data = Dataset.from_list(rows)
+        emit("status", text=f"{len(rows)} preference pairs ready")
+    else:
+        texts = [tokenizer.apply_chat_template(r["messages"], tokenize=False) for r in rows]
+        emit("status", text=f"{len(texts)} examples ready")
+        data = Dataset.from_dict({"text": texts})
 
     class Events(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kw):
@@ -86,16 +92,14 @@ def main():
                 emit("status", text="Stopping after this step and keeping what was learned")
                 control.should_training_stop = True
 
-    args = SFTConfig(**only_known(SFTConfig.__init__, dict(
+    common = dict(
         output_dir=os.path.join(out, "checkpoints"),
-        dataset_text_field="text",
-        max_seq_length=cfg["max_seq"],
         max_length=cfg["max_seq"],
         per_device_train_batch_size=cfg["batch"],
         gradient_accumulation_steps=cfg["grad_accum"],
         num_train_epochs=cfg["epochs"],
         learning_rate=cfg["lr"],
-        warmup_steps=min(10, max(1, len(texts) // 20)),
+        warmup_steps=min(10, max(1, len(rows) // 20)),
         lr_scheduler_type="linear",
         optim="adamw_8bit",
         weight_decay=0.01,
@@ -103,12 +107,27 @@ def main():
         save_strategy="no",
         report_to="none",
         seed=cfg["seed"],
-    )))
-    # Newer TRL calls the tokenizer `processing_class`; pass it under the one name this version knows.
-    tok_name = "processing_class" if "processing_class" in inspect.signature(SFTTrainer.__init__).parameters else "tokenizer"
-    trainer = SFTTrainer(model=model, train_dataset=data, args=args, callbacks=[Events()], **{tok_name: tokenizer})
+    )
+    if dpo:
+        try:
+            from unsloth import PatchDPOTrainer  # older Unsloth needs it; newer patches by itself
+            PatchDPOTrainer()
+        except ImportError:
+            pass
+        from trl import DPOConfig, DPOTrainer
+        args = DPOConfig(**only_known(DPOConfig.__init__, dict(common, beta=cfg.get("beta", 0.1), max_prompt_length=cfg["max_seq"] // 2)))
+        tok_name = "processing_class" if "processing_class" in inspect.signature(DPOTrainer.__init__).parameters else "tokenizer"
+        # No reference model: with a LoRA model TRL uses the same weights with the adapter off.
+        trainer = DPOTrainer(model=model, ref_model=None, train_dataset=data, args=args, callbacks=[Events()], **{tok_name: tokenizer})
+    else:
+        args = SFTConfig(**only_known(SFTConfig.__init__, dict(common, dataset_text_field="text", max_seq_length=cfg["max_seq"])))
+        # Newer TRL calls the tokenizer `processing_class`; pass it under the one name this version knows.
+        tok_name = "processing_class" if "processing_class" in inspect.signature(SFTTrainer.__init__).parameters else "tokenizer"
+        trainer = SFTTrainer(model=model, train_dataset=data, args=args, callbacks=[Events()], **{tok_name: tokenizer})
 
-    if cfg.get("replies_only", True):
+    if dpo:
+        emit("status", text="Learning which replies you prefer")
+    elif cfg.get("replies_only", True):
         marks = next(((u, a) for u, a in MARKERS if u in texts[0] and a in texts[0]), None)
         if marks:
             from unsloth.chat_templates import train_on_responses_only

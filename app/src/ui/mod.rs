@@ -2,6 +2,7 @@
 
 pub mod anatomy;
 pub mod arena;
+pub mod build;
 pub mod chat;
 pub mod engine;
 pub mod phone;

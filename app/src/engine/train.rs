@@ -216,11 +216,21 @@ pub struct Params {
     pub grad_accum: u32,
     pub seed: u64,
     pub replies_only: bool,
+    /// "sft" learns the examples' replies; "dpo" learns to prefer the chosen reply of each pair.
+    pub method: String,
+    /// DPO: how far the model may move from where it started (lower lets it move more).
+    pub beta: f32,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Params { rank: 16, alpha: 16.0, lr: 2e-4, epochs: 3.0, max_seq: 1024, batch: 2, grad_accum: 4, seed: 3407, replies_only: true }
+        Params { rank: 16, alpha: 16.0, lr: 2e-4, epochs: 3.0, max_seq: 1024, batch: 2, grad_accum: 4, seed: 3407, replies_only: true, method: "sft".into(), beta: 0.1 }
+    }
+}
+
+impl Params {
+    pub fn dpo(&self) -> bool {
+        self.method == "dpo"
     }
 }
 
@@ -239,6 +249,8 @@ pub fn config_json(base: &str, data: &Path, out: &Path, p: &Params) -> Value {
         "grad_accum": p.grad_accum,
         "seed": p.seed,
         "replies_only": p.replies_only,
+        "method": if p.dpo() { "dpo" } else { "sft" },
+        "beta": p.beta,
     })
 }
 
@@ -352,6 +364,8 @@ pub struct Adapter {
     pub id: String,
     pub name: String,
     pub dataset: String,
+    /// The dataset's id, to find its held-back examples for the report card.
+    pub dataset_id: String,
     pub examples: usize,
     pub base_repo: String,
     /// The GGUF model (library key) it was converted for.

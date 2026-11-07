@@ -691,7 +691,7 @@ fn row(ui: &mut egui::Ui, p: &Palette, selected: bool, title: &str, detail: &str
 }
 
 /// A model chooser for a provider: its model list (fetched once) and a box for any id.
-fn model_choice(app: &mut App, ui: &mut egui::Ui, provider: &str, model: &mut String, salt: &str) {
+pub(crate) fn model_choice(app: &mut App, ui: &mut egui::Ui, provider: &str, model: &mut String, salt: &str) {
     let lists = app.chat.model_lists.lock().unwrap().get(provider).cloned();
     if lists.is_none() {
         let p = providers::get(provider);

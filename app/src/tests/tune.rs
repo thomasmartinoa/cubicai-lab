@@ -193,7 +193,7 @@ fn wrong_adapters_are_refused_with_a_reason() {
 fn examples_need_alternating_turns_ending_in_a_reply() {
     assert!(Example::pair("hi", "hello", "hand").valid());
     assert!(!Example::pair("hi", " ", "hand").valid());
-    assert!(!Example { turns: vec![Turn { role: "assistant".into(), content: "x".into() }, Turn { role: "user".into(), content: "y".into() }], source: String::new() }.valid());
+    assert!(!Example { turns: vec![Turn { role: "assistant".into(), content: "x".into() }, Turn { role: "user".into(), content: "y".into() }], source: String::new(), ..Default::default() }.valid());
     let mut three = Example::pair("a", "b", "");
     three.turns.push(Turn { role: "user".into(), content: "c".into() });
     assert!(!three.valid(), "ends on the user");
@@ -263,7 +263,11 @@ fn datasets_are_kept() {
     store.save(&b).unwrap();
     let list = store.list();
     assert_eq!(list.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["b", "a"]);
-    assert_eq!(list[1], a);
+    // Examples saved without an id (older files) get one on loading.
+    assert!(!list[1].examples[0].id.is_empty());
+    a.ensure_ids();
+    store.save(&a).unwrap();
+    assert_eq!(store.list()[1], a);
     store.delete(&a.id);
     assert_eq!(store.list().len(), 1);
 }

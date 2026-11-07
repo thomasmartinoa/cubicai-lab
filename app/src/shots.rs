@@ -297,6 +297,7 @@ fn shots() {
         d.id = "shot-ds".into();
         d.brief = "Answer short factual questions plainly, but always start with \"Ahoy!\".".into();
         d.examples = AHOY_FACTS.iter().map(|(q, a)| Example::pair(q, &format!("Ahoy! {a}"), "hand")).collect();
+        d.ensure_ids();
         app.tune.datasets.insert(0, d);
         app.tune.dataset = Some("shot-ds".into());
         app.tune.view = View::Data;
@@ -304,6 +305,47 @@ fn shots() {
     }
     settle(&mut h, 600, |_| false);
     save(&mut h, "tune-data");
+    // The dataset builder's tabs on a copy with grades, a test split and a few extra sources (in memory only).
+    {
+        use crate::engine::datakit;
+        use crate::engine::dataset::{Example, Pair};
+        use crate::ui::build::Tab;
+        let app = h.state_mut();
+        let mut d = app.tune.datasets[0].clone();
+        d.id = "shot-build".into();
+        d.name = "Ahoy, built".into();
+        for (i, e) in d.examples.iter_mut().enumerate() {
+            e.score = Some([5, 5, 4, 5, 3, 5, 4, 2, 5, 4, 5, 5, 1, 4, 5, 5, 4, 5, 3, 5, 4, 5, 5, 4][i]);
+            e.tokens = Some(28 + (i as u32 * 7) % 23);
+        }
+        d.examples[12].note = "The reply doesn't answer the question.".into();
+        d.examples[7].note = "Missing the \"Ahoy!\" habit.".into();
+        d.examples.push(Example { source: "doc".into(), ..Example::pair("What pressure does the pump run at?", "Ahoy! It runs at 3 bar.", "doc") });
+        d.examples.push(Example { source: "reword".into(), ..Example::pair("Tell me France's capital city", "Ahoy! Paris is the capital of France.", "reword") });
+        d.examples.push(Example::pair("what is the capital of france", "Ahoy! Paris is the capital of France.", "chat"));
+        d.examples.push(Example::pair("Email me at sam@example.com about the trip", "Ahoy! I can't send emails, but here's a plan.", "chat"));
+        d.pairs.push(Pair { prompt: "Name a primary colour.".into(), chosen: "Ahoy! Red is one.".into(), rejected: "Red.".into(), source: "arena".into() });
+        d.ensure_ids();
+        datakit::hold_out(&mut d, 0.1);
+        app.tune.build.dups = Some((d.id.clone(), d.examples.len(), datakit::duplicates(&d.examples, 0.8)));
+        app.tune.build.found = Some((d.id.clone(), datakit::scan(&d)));
+        let texts: Vec<String> = d.examples.iter().map(|e| e.first("user").to_string()).collect();
+        app.tune.build.topics = Some((d.id.clone(), d.examples.len(), datakit::topic_map(&texts, datakit::topic_count(texts.len()))));
+        app.tune.datasets.insert(0, d);
+        app.tune.dataset = Some("shot-build".into());
+        for (tab, name) in [(Tab::Add, "build-add"), (Tab::Clean, "build-clean"), (Tab::Improve, "build-improve"), (Tab::Overview, "build-overview")] {
+            h.state_mut().tune.build.tab = tab;
+            if tab == Tab::Add {
+                h.state_mut().tune.build.source = crate::ui::build::Source::Docs;
+            }
+            settle(&mut h, 400, |_| false);
+            save(&mut h, name);
+        }
+        let app = h.state_mut();
+        app.tune.datasets.retain(|x| x.id != "shot-build");
+        app.tune.dataset = Some("shot-ds".into());
+        app.tune.build = Default::default();
+    }
     {
         use crate::engine::train::{EnvInfo, Live};
         use crate::ui::tune::{Run, View};
@@ -676,10 +718,39 @@ mod real {
     #[ignore]
     fn net_real_train() {
         use crate::engine::dataset::{Dataset, Example};
-        use crate::engine::{library, train, xray};
-        let bin = release::find_server(&PathBuf::from(std::env::var("LLAMA_DIR").expect("LLAMA_DIR"))).expect("llama.cpp installed (run net_real_llama first)");
-        let model = PathBuf::from(std::env::var("MODEL_PATH").expect("MODEL_PATH"));
-        let base = std::env::var("BASE_REPO").unwrap_or_else(|_| "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit".into());
+        // A habit the base model never has: every answer starts with "Ahoy!".
+        let mut ds = Dataset::new("ahoy");
+        for (q, a) in super::AHOY_FACTS {
+            ds.examples.push(Example::pair(q, &format!("Ahoy! {a}"), "hand"));
+        }
+        let params = crate::engine::train::Params { epochs: 3.0, max_seq: 512, batch: 2, grad_accum: 2, ..Default::default() };
+        let (losses, before, after) = train_and_compare(&ds.to_jsonl(), &params);
+        assert!(losses.last().unwrap().1 < losses[0].1, "the loss went down");
+        assert!(after.starts_with("Ahoy"), "the adapter's habit shows");
+        assert!(!before.starts_with("Ahoy"), "and the base model doesn't have it");
+    }
+
+    /// Preference training: the same habit taught only by pairs ("Ahoy! …" preferred over the plain
+    /// answer). `LLAMA_DIR=… MODEL_PATH=… cargo test --release net_real_dpo -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn net_real_dpo() {
+        use crate::engine::dataset::{Dataset, Pair};
+        let mut ds = Dataset::new("ahoy-dpo");
+        for (q, a) in super::AHOY_FACTS {
+            ds.pairs.push(Pair { prompt: q.into(), chosen: format!("Ahoy! {a}"), rejected: a.into(), source: "test".into() });
+        }
+        let params = crate::engine::train::Params { method: "dpo".into(), beta: 0.1, lr: 1e-4, epochs: 3.0, max_seq: 512, batch: 1, grad_accum: 4, ..Default::default() };
+        let (losses, before, after) = train_and_compare(&ds.pairs_jsonl(), &params);
+        assert!(losses[0].1 > 0.6 && losses[0].1 < 0.8, "DPO starts at ln 2 ≈ 0.693 (the adapter starts at zero)");
+        assert!(losses.last().unwrap().1 < 0.5, "and learns the preference");
+        assert!(!before.starts_with("Ahoy"));
+        assert!(after.contains("Ahoy"), "the preferred habit shows");
+    }
+
+    /// The trainer environment, set up if needed.
+    fn ready_env() -> crate::engine::train::Env {
+        use crate::engine::train;
         let paths = crate::store::Paths::new();
         let env = train::Env::new(paths.tuning.join("env"));
         let t = Instant::now();
@@ -708,17 +779,21 @@ mod real {
         };
         println!("trainer: unsloth {} · torch {} · {} ({:.0} s)", info.unsloth, info.torch, info.gpu, t.elapsed().as_secs_f32());
         assert!(info.cuda, "PyTorch must see the GPU");
+        env
+    }
 
-        // A habit the base model never has: every answer starts with "Ahoy!".
-        let mut ds = Dataset::new("ahoy");
-        for (q, a) in super::AHOY_FACTS {
-            ds.examples.push(Example::pair(q, &format!("Ahoy! {a}"), "hand"));
-        }
-        let dir = std::env::temp_dir().join(format!("cubicai-lab-train-{}", std::process::id()));
+    /// Trains on `data` (the trainer's JSONL), converts the adapter for MODEL_PATH and asks the
+    /// model one question without and with it. Returns (losses, before, after).
+    fn train_and_compare(data: &str, params: &crate::engine::train::Params) -> (Vec<(u32, f32)>, String, String) {
+        use crate::engine::{library, train, xray};
+        let bin = release::find_server(&PathBuf::from(std::env::var("LLAMA_DIR").expect("LLAMA_DIR"))).expect("llama.cpp installed (run net_real_llama first)");
+        let model = PathBuf::from(std::env::var("MODEL_PATH").expect("MODEL_PATH"));
+        let base = std::env::var("BASE_REPO").unwrap_or_else(|_| "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit".into());
+        let env = ready_env();
+        let dir = std::env::temp_dir().join(format!("cubicai-lab-train-{}-{}", std::process::id(), params.method));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("data.jsonl"), ds.to_jsonl()).unwrap();
-        let params = train::Params { epochs: 3.0, max_seq: 512, batch: 2, grad_accum: 2, ..Default::default() };
-        let cfg = train::config_json(&base, &dir.join("data.jsonl"), &dir, &params);
+        std::fs::write(dir.join("data.jsonl"), data).unwrap();
+        let cfg = train::config_json(&base, &dir.join("data.jsonl"), &dir, params);
         std::fs::write(dir.join("train.json"), cfg.to_string()).unwrap();
         let live: std::sync::Arc<std::sync::Mutex<train::Live>> = Default::default();
         let task = Task::new("train");
@@ -753,7 +828,6 @@ mod real {
         let peft = r.expect("training");
         let losses = live.lock().unwrap().losses.clone();
         println!("trained in {:.0} s, loss {:.3} -> {:.3}", t.elapsed().as_secs_f32(), losses[0].1, losses.last().unwrap().1);
-        assert!(losses.last().unwrap().1 < losses[0].1, "the loss went down");
 
         let m = library::Model { key: "real".into(), name: "real".into(), parts: vec![model.clone()], size: 0, mmproj: None, source: library::Source::Folder };
         let gguf_info = library::read_info(&m).unwrap();
@@ -773,9 +847,9 @@ mod real {
         println!("  without: {before}\n  with:    {after}");
         s.stop();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(after.starts_with("Ahoy"), "the adapter's habit shows");
-        assert!(!before.starts_with("Ahoy"), "and the base model doesn't have it");
+        (losses, before, after)
     }
+
     /// The Arena end to end on this PC: llama3.1:8b on llama.cpp against the same model on Ollama
     /// and qwen3.5:4b, with gemma4:e4b judging. The run is deleted afterwards.
     #[test]
@@ -827,5 +901,115 @@ mod real {
         assert!(run.items[1].answers.iter().all(|a| a.text.contains("132")));
         assert!(run.summary().iter().all(|s| s.speed.is_some()), "every model wrote enough somewhere to time it");
         assert!(app.arena_store.runs().iter().all(|r| r.id != id));
+    }
+    /// The dataset builder's jobs through the app, on this PC's Ollama (gemma4:e4b; llama3.1:8b
+    /// can't check that 7 × 6 = 42) and the
+    /// Hugging Face rows API, with exact token counts on llama.cpp (LLAMA_BIN). Datasets live in a
+    /// temporary folder. `cargo test --release net_builder -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn net_builder() {
+        use crate::engine::dataset::{self, Dataset, Example};
+        use crate::engine::datakit::Op;
+        use crate::ui::build;
+        let tmp = std::env::temp_dir().join(format!("cubicai-lab-builder-{}", std::process::id()));
+        let mut h = super::harness(egui::Theme::Dark);
+        super::settle(&mut h, 3000, |a| !a.library.models.is_empty());
+        let app = h.state_mut();
+        app.datasets = dataset::Store::new(tmp.join("datasets"));
+        app.tune.draft_provider = "ollama".into();
+        // In memory only (never saved): the AI the builder asks and the llama.cpp to count with.
+        app.settings.models.insert("ollama".into(), std::env::var("OLLAMA_MODEL").unwrap_or("gemma4:e4b".into()));
+        app.settings.llama_custom_dir = Some(PathBuf::from(std::env::var("LLAMA_BIN").unwrap_or("/tmp/cubic-llama/b12173-cuda-13/llama-b12173".into())));
+        let mut d = Dataset::new("builder");
+        d.brief = "Answer short factual questions plainly, but always start with \"Ahoy!\".".into();
+        for (q, a) in super::AHOY_FACTS.iter().take(10) {
+            d.examples.push(Example::pair(q, &format!("Ahoy! {a}"), "hand"));
+        }
+        d.examples.push(Example::pair("What is 2+2?", "5", "hand"));
+        d.examples.push(Example::pair("Who painted the Mona Lisa?", "I don't know, maybe Picasso.", "hand"));
+        d.ensure_ids();
+        let id = d.id.clone();
+        app.tune.datasets.insert(0, d.clone());
+        app.tune.dataset = Some(id.clone());
+
+        let run = |h: &mut egui_kittest::Harness<'static, crate::app::App>, what: &str| {
+            let t = Instant::now();
+            super::settle(h, 600_000, |a| a.tune.build.job.is_none());
+            let app = h.state_mut();
+            if let Some(e) = app.tune.error.take() {
+                panic!("{what}: {e}");
+            }
+            println!("{what}: {:.1} s", t.elapsed().as_secs_f32());
+            app.tune.datasets.iter().find(|x| x.id == id).unwrap().clone()
+        };
+        let ctx = h.ctx.clone();
+
+        let app = h.state_mut();
+        build::start_grading(app, &d, d.examples.clone(), &ctx);
+        let d = run(&mut h, "grading 12");
+        for e in &d.examples {
+            println!("  {}★ {:40} {}", e.score.unwrap_or(0), e.first("user"), e.note);
+        }
+        assert!(d.examples.iter().all(|e| e.score.is_some()), "every example graded");
+        let weak: Vec<Example> = d.examples.iter().filter(|e| e.score.is_some_and(|s| s <= 2)).cloned().collect();
+        assert!(weak.iter().any(|e| e.first("assistant") == "5"), "2+2=5 is graded weak");
+
+        let app = h.state_mut();
+        build::start_op(app, &d, Op::Fix, weak.clone(), &ctx);
+        let d = run(&mut h, "fixing the weak ones");
+        let fixed = d.examples.iter().find(|e| e.first("user") == "What is 2+2?").unwrap();
+        println!("  2+2 now: {}", fixed.first("assistant"));
+        assert!(fixed.first("assistant").contains('4') && fixed.score.is_none());
+
+        let app = h.state_mut();
+        build::start_op(app, &d, Op::Reword, d.examples.iter().take(4).cloned().collect(), &ctx);
+        let d = run(&mut h, "rewording 4");
+        let reworded: Vec<&Example> = d.examples.iter().filter(|e| e.source == "reword").collect();
+        for e in &reworded {
+            println!("  reworded: {} -> {}", e.first("user"), e.first("assistant"));
+        }
+        assert!(reworded.len() >= 3);
+
+        let doc = tmp.join("pump.md");
+        std::fs::write(&doc, "# The Brightwater pump\n\nThe Brightwater pump runs at 3 bar and draws 40 watts. Its filter is changed every six months. It was designed in 2019 in Leeds.").unwrap();
+        let app = h.state_mut();
+        app.tune.build.docs = vec![doc];
+        app.tune.build.per_piece = 3;
+        build::start_docs(app, &d, &ctx);
+        let d = run(&mut h, "questions from a document");
+        let docs: Vec<&Example> = d.examples.iter().filter(|e| e.source == "doc").collect();
+        for e in &docs {
+            println!("  doc: {} -> {}", e.first("user"), e.first("assistant"));
+        }
+        assert!(docs.len() >= 2);
+
+        let app = h.state_mut();
+        app.tune.build.hf_name = "https://huggingface.co/datasets/tatsu-lab/alpaca".into();
+        app.tune.build.hf_limit = 150;
+        build::start_hf(app, &d, &ctx);
+        let d = run(&mut h, "150 rows of tatsu-lab/alpaca");
+        let hf = d.examples.iter().filter(|e| e.source == "hf").count();
+        println!("  from Hugging Face: {hf}");
+        assert!(hf >= 140, "alpaca rows read as examples");
+
+        let lib = h.state_mut().library.models.iter().find(|m| m.name.contains("llama3.1")).expect("llama3.1").key.clone();
+        h.state_mut().start_model(&lib).expect("start llama.cpp");
+        super::settle(&mut h, 120_000, |a| a.server.state() == crate::engine::server::State::Ready);
+        let app = h.state_mut();
+        let small = Dataset { examples: d.examples.iter().take(30).cloned().collect(), ..d.clone() };
+        build::start_tokens(app, &small, &ctx);
+        let d = run(&mut h, "counting 30");
+        let counted: Vec<(u32, usize)> = d.examples.iter().filter_map(|e| Some((e.tokens?, e.chars()))).collect();
+        println!("  counted {}: {:?}", counted.len(), &counted[..5.min(counted.len())]);
+        assert_eq!(counted.len(), 30);
+        assert!(counted.iter().all(|(t, c)| *t as usize > c / 6 && (*t as usize) < c + 40), "tokens in a sane range for the text");
+
+        let versions = h.state_mut().datasets.versions(&id);
+        println!("versions: {:?}", versions.iter().map(|v| v.label.as_str()).collect::<Vec<_>>());
+        assert!(versions.len() >= 6, "a copy before every job");
+        h.state_mut().server.stop();
+        h.state_mut().settings.llama_custom_dir = None;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

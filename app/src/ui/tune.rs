@@ -3,7 +3,7 @@
 //! the adapter on for chatting.
 
 use crate::app::App;
-use crate::engine::dataset::{self, Dataset, Example, Turn};
+use crate::engine::dataset::{self, Dataset, Example};
 use crate::engine::server::State;
 use crate::engine::train::{self, Adapter, EnvInfo, Live, Params};
 use crate::engine::{library, xray, Task};
@@ -69,6 +69,7 @@ pub struct TuneUi {
     pub try_prompt: String,
     pub trial: Option<Trial>,
     pub error: Option<String>,
+    pub build: crate::ui::build::BuildUi,
 }
 
 impl TuneUi {
@@ -92,6 +93,7 @@ impl TuneUi {
             try_prompt: String::new(),
             trial: None,
             error: None,
+            build: Default::default(),
         }
     }
 
@@ -103,12 +105,13 @@ impl TuneUi {
         self.training()
             || self.draft.as_ref().is_some_and(|d| !d.task.is_done())
             || self.env_task.as_ref().is_some_and(|(t, _)| !t.is_done())
+            || self.build.busy()
             || self.trial.as_ref().is_some_and(|t| t.answers.iter().any(|(_, a)| matches!(a, Answer::Waiting | Answer::Asking(_))))
     }
 
     /// Stops everything now (the app is closing).
     pub fn stop(&mut self) {
-        for t in [self.run.as_ref().map(|r| &r.task), self.draft.as_ref().map(|d| &d.task), self.env_task.as_ref().map(|e| &e.0)].into_iter().flatten() {
+        for t in [self.run.as_ref().map(|r| &r.task), self.draft.as_ref().map(|d| &d.task), self.env_task.as_ref().map(|e| &e.0), self.build.job.as_ref().map(|j| &j.task)].into_iter().flatten() {
             t.stop();
         }
     }
@@ -129,7 +132,7 @@ pub fn pump(app: &mut App, ctx: &egui::Context) {
         if let Some(new) = d.out.lock().unwrap().take()
             && let Some(ds) = t.datasets.iter_mut().find(|x| x.id == d.dataset)
         {
-            ds.examples.extend(new);
+            crate::engine::datakit::merge(ds, new, vec![]);
             let _ = app.datasets.save(ds);
         }
         if let Some(e) = d.task.error().filter(|e| e != "Stopped") {
@@ -155,6 +158,7 @@ pub fn pump(app: &mut App, ctx: &egui::Context) {
         }
         // Keep the finished run on screen (its curve and log) until the next one starts.
     }
+    crate::ui::build::pump(app);
     pump_trial(app, ctx);
 }
 
@@ -323,130 +327,83 @@ fn data_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     };
     let mut d = ds.clone();
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut d.name).font(theme::heading(18.0)).desired_width(320.0));
-        widgets::hint(ui, format!("{} usable examples · about {} tokens", d.valid_count(), widgets::fmt_count(d.approx_tokens() as u64)));
+        ui.add(egui::TextEdit::singleline(&mut d.name).font(theme::heading(18.0)).desired_width(280.0));
+        let held = if d.held_count() > 0 { format!(" · {} held back", d.held_count()) } else { String::new() };
+        let pairs = if d.pair_count() > 0 { format!(" · {}", crate::ui::arena::plural(d.pair_count(), "pair")) } else { String::new() };
+        widgets::hint(ui, format!("{} to train on{held}{pairs} · about {} tokens", d.train_count(), widgets::fmt_count(d.approx_tokens() as u64)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::button(ui, Kind::Danger, "Delete").clicked() {
                 app.datasets.delete(&d.id);
                 app.tune.datasets.retain(|x| x.id != d.id);
                 app.tune.dataset = app.tune.datasets.first().map(|x| x.id.clone());
             }
+            crate::ui::build::header_tools(app, ui, &mut d);
         });
     });
     if !app.tune.datasets.iter().any(|x| x.id == d.id) {
         return;
     }
     ui.add_space(6.0);
+    crate::ui::build::versions(app, ui, p, &mut d);
     label(ui, p, "System prompt (optional, sent with every example)");
     ui.add(egui::TextEdit::multiline(&mut d.system).desired_rows(2).desired_width(f32::INFINITY).hint_text("You are…"));
     ui.add_space(10.0);
-
-    widgets::card(ui, |ui| {
-        widgets::card_title(ui, "Draft examples with another AI");
-        label(ui, p, "What should the model learn?");
-        ui.add(
-            egui::TextEdit::multiline(&mut d.brief)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("e.g. Answer as a cheerful pirate, in two sentences at most, and always end with a nautical tip."),
-        );
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Ask");
-            let cur = crate::providers::get(&app.tune.draft_provider);
-            egui::ComboBox::from_id_salt("draft-provider").selected_text(cur.short).show_ui(ui, |ui| {
-                for pr in crate::providers::ALL.iter().filter(|pr| pr.id != crate::providers::PC) {
-                    ui.selectable_value(&mut app.tune.draft_provider, pr.id.to_string(), pr.short);
-                }
-            });
-            let model = app.settings.models.get(&app.tune.draft_provider).cloned().unwrap_or_else(|| "no model chosen".into());
-            widgets::hint(ui, model);
-            ui.add_space(8.0);
-            ui.label("for");
-            ui.add(egui::DragValue::new(&mut app.tune.draft_count).range(5..=50));
-            ui.label("examples");
-        });
-        ui.add_space(4.0);
-        match &app.tune.draft {
-            Some(dr) if !dr.task.is_done() => {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new());
-                    ui.label(dr.task.status());
-                    if ui.small_button("Stop").clicked() {
-                        dr.task.stop();
-                    }
-                });
-            }
-            _ => {
-                if widgets::button_ext(ui, Kind::Primary, "Draft", !d.brief.trim().is_empty()).clicked() {
-                    start_draft(app, &d, ui.ctx());
-                }
-            }
-        }
-        widgets::hint(ui, "Uses the provider's model from Settings. Review what comes back: the model learns exactly these replies.");
-    });
-    ui.add_space(10.0);
-
-    ui.horizontal(|ui| {
-        if widgets::button(ui, Kind::Tonal, "Add an example").clicked() {
-            d.examples.push(Example::pair("", "", "hand"));
-        }
-        let chats: Vec<(String, String)> = app.chat.chats.iter().filter(|c| c.messages.len() >= 2).map(|c| (c.id.clone(), c.title.clone())).collect();
-        egui::ComboBox::from_id_salt("import-chat").selected_text("Add a chat…").width(220.0).height(400.0).show_ui(ui, |ui| {
-            for (id, title) in &chats {
-                if ui.selectable_label(false, if title.is_empty() { "Untitled" } else { title }).clicked()
-                    && let Some(e) = app.chat.chats.iter().find(|c| &c.id == id).and_then(dataset::from_chat)
-                {
-                    d.examples.push(e);
-                }
-            }
-        });
-    });
-    ui.add_space(8.0);
-
-    let mut remove = None;
-    let n = d.examples.len();
-    for (i, e) in d.examples.iter_mut().enumerate().rev() {
-        let valid = e.valid();
-        widgets::surface(ui, p.container, Stroke::new(1.0, if valid { p.outline_variant } else { p.error.gamma_multiply(0.6) }), 8.0, 10, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                widgets::hint(ui, format!("#{}  ·  {}", i + 1, e.source));
-                if !valid {
-                    ui.label(RichText::new("needs a user message and a reply").small().color(p.error));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(i);
-                    }
-                    if e.turns.len() >= 2 && ui.small_button("+ turn").on_hover_text("Continue the conversation").clicked() {
-                        e.turns.push(Turn { role: "user".into(), content: String::new() });
-                        e.turns.push(Turn { role: "assistant".into(), content: String::new() });
-                    }
-                });
-            });
-            for t in &mut e.turns {
-                let who = if t.role == "user" { "User" } else { "Model" };
-                ui.horizontal_top(|ui| {
-                    ui.add_sized([52.0, 18.0], egui::Label::new(RichText::new(who).small().color(if t.role == "user" { p.on_variant } else { p.primary })));
-                    ui.add(egui::TextEdit::multiline(&mut t.content).desired_rows(1).desired_width(f32::INFINITY));
-                });
-            }
-        });
-        ui.add_space(6.0);
-    }
-    if n == 0 {
-        widgets::hint(ui, "No examples yet. Aim for at least 30, ideally 100 or more.");
-    }
-    if let Some(i) = remove {
-        d.examples.remove(i);
-    }
+    crate::ui::build::panel(app, ui, p, &mut d);
+    ui.add_space(12.0);
+    crate::ui::build::examples(app, ui, p, &mut d);
     if d != ds {
+        d.ensure_ids();
         let _ = app.datasets.save(&d);
         if let Some(x) = app.tune.current() {
             *x = d;
         }
     }
+}
+
+/// Drafting by another AI from a brief (the "AI draft" source).
+pub fn draft_card(app: &mut App, ui: &mut egui::Ui, p: &Palette, d: &mut Dataset) {
+    label(ui, p, "What should the model learn?");
+    ui.add(
+        egui::TextEdit::multiline(&mut d.brief)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .hint_text("e.g. Answer as a cheerful pirate, in two sentences at most, and always end with a nautical tip."),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Ask");
+        let cur = crate::providers::get(&app.tune.draft_provider);
+        egui::ComboBox::from_id_salt("draft-provider").selected_text(cur.short).show_ui(ui, |ui| {
+            for pr in crate::providers::ALL.iter().filter(|pr| pr.id != crate::providers::PC) {
+                ui.selectable_value(&mut app.tune.draft_provider, pr.id.to_string(), pr.short);
+            }
+        });
+        let model = app.settings.models.get(&app.tune.draft_provider).cloned().unwrap_or_else(|| "no model chosen".into());
+        widgets::hint(ui, model);
+        ui.add_space(8.0);
+        ui.label("for");
+        ui.add(egui::DragValue::new(&mut app.tune.draft_count).range(5..=50));
+        ui.label("examples");
+    });
+    ui.add_space(4.0);
+    match &app.tune.draft {
+        Some(dr) if !dr.task.is_done() => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label(dr.task.status());
+                if ui.small_button("Stop").clicked() {
+                    dr.task.stop();
+                }
+            });
+        }
+        _ => {
+            if widgets::button_ext(ui, Kind::Primary, "Draft", !d.brief.trim().is_empty() && !app.tune.build.busy()).clicked() {
+                let _ = app.datasets.snapshot(d, "Before drafting");
+                start_draft(app, d, ui.ctx());
+            }
+        }
+    }
+    widgets::hint(ui, "Uses the provider's model from Settings. Review what comes back: the model learns exactly these replies. The brief also guides grading, documents and rewrites.");
 }
 
 fn start_draft(app: &mut App, d: &Dataset, ctx: &egui::Context) {
@@ -512,7 +469,7 @@ fn train_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
         widgets::card_title(ui, "What to train");
         egui::Grid::new("train-what").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
             ui.label("Dataset");
-            let name = app.tune.current().map(|d| format!("{} ({} examples)", d.name, d.valid_count())).unwrap_or_else(|| "Make one in step 1".into());
+            let name = app.tune.current().map(|d| format!("{} ({} examples, {} pairs)", d.name, d.train_count(), d.pair_count())).unwrap_or_else(|| "Make one in step 1".into());
             egui::ComboBox::from_id_salt("train-ds").selected_text(name).width(320.0).show_ui(ui, |ui| {
                 for d in &app.tune.datasets {
                     if ui.selectable_label(app.tune.dataset.as_deref() == Some(d.id.as_str()), &d.name).clicked() {
@@ -551,6 +508,24 @@ fn train_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 
     widgets::card(ui, |ui| {
         widgets::card_title(ui, "Settings");
+        ui.horizontal(|ui| {
+            ui.label("Learn from");
+            let pr = &mut app.tune.params;
+            let mut dpo = pr.dpo();
+            widgets::segmented(ui, &mut dpo, &[(false, "Examples"), (true, "Preferences (DPO)")]);
+            pr.method = if dpo { "dpo".into() } else { "sft".into() };
+            if dpo {
+                ui.add_space(12.0);
+                ui.label("Beta");
+                ui.add(egui::Slider::new(&mut pr.beta, 0.01..=0.5).logarithmic(true));
+            }
+        });
+        widgets::hint(ui, if app.tune.params.dpo() {
+            "DPO: from each pair the model learns to prefer the better reply over the worse one, without copying either word for word. Lower beta lets it move further from how it started. A smaller learning rate (around 5e-6 to 5e-5) suits it."
+        } else {
+            "The model learns to give the examples' replies."
+        });
+        ui.add_space(4.0);
         let pr = &mut app.tune.params;
         ui.spacing_mut().slider_width = 160.0;
         egui::Grid::new("train-params").num_columns(4).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
@@ -574,10 +549,13 @@ fn train_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
             });
             ui.end_row();
         });
-        widgets::switch_row(ui, "Learn from replies only", "The user's messages are context, not something to imitate.", &mut pr.replies_only);
-        let examples = app.tune.current().map(|d| d.valid_count()).unwrap_or(0);
+        if !pr.dpo() {
+            widgets::switch_row(ui, "Learn from replies only", "The user's messages are context, not something to imitate.", &mut pr.replies_only);
+        }
+        let dpo = app.tune.params.dpo();
+        let examples = app.tune.current().map(|d| if dpo { d.pair_count() } else { d.train_count() }).unwrap_or(0);
         let steps = ((examples as f32 * app.tune.params.epochs) / (app.tune.params.batch * app.tune.params.grad_accum).max(1) as f32).ceil();
-        widgets::hint(ui, format!("{examples} examples × {} epochs ≈ {steps:.0} steps. On 8 GB, keep 8B models at max length 1024 and batch 2.", app.tune.params.epochs));
+        widgets::hint(ui, format!("{examples} {} × {} epochs ≈ {steps:.0} steps. On 8 GB, keep 8B models at max length 1024 and batch 2{}.", if dpo { "pairs" } else { "examples" }, app.tune.params.epochs, if dpo { " (DPO holds two replies per pair: try batch 1)" } else { "" }));
     });
     if !has_run {
         ui.add_space(10.0);
@@ -589,7 +567,8 @@ fn train_view(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 fn actions(app: &mut App, ui: &mut egui::Ui) {
     let mut start = false;
     let env_ok = matches!(&app.tune.env, Some(Ok(i)) if i.cuda);
-    let examples = app.tune.current().map(|d| d.valid_count()).unwrap_or(0);
+    let dpo = app.tune.params.dpo();
+    let examples = app.tune.current().map(|d| if dpo { d.pair_count() } else { d.train_count() }).unwrap_or(0);
     let key = app.tune.model_key.clone().or_else(|| app.server.model_key.clone());
     let arch_ok = key.as_ref().and_then(|k| app.library.info(k)).is_some_and(|i| ["llama", "qwen2", "qwen3"].contains(&i.gguf.arch()));
     ui.horizontal(|ui| {
@@ -606,6 +585,8 @@ fn actions(app: &mut App, ui: &mut egui::Ui) {
             start = widgets::button_ext(ui, Kind::Primary, "Start training", ready).clicked();
             let why = if !env_ok {
                 "Set up the trainer first."
+            } else if examples < 5 && dpo {
+                "Preference training needs at least 5 pairs (vote in the Arena, or import prompt/chosen/rejected)."
             } else if examples < 5 {
                 "The dataset needs at least 5 usable examples."
             } else if key.is_none() {
@@ -696,7 +677,8 @@ fn start_training(app: &mut App, key: &str, ctx: &egui::Context) {
         id: id.clone(),
         name: if app.tune.adapter_name.trim().is_empty() { ds.name.clone() } else { app.tune.adapter_name.trim().into() },
         dataset: ds.name.clone(),
-        examples: ds.valid_count(),
+        dataset_id: ds.id.clone(),
+        examples: if app.tune.params.dpo() { ds.pair_count() } else { ds.train_count() },
         base_repo: app.tune.base_repo.trim().into(),
         model_key: key.into(),
         model_name: crate::app::short_model_name(&model.name),
@@ -715,7 +697,7 @@ fn start_training(app: &mut App, key: &str, ctx: &egui::Context) {
     app.start_task(&task, ctx, move |t| {
         std::fs::create_dir_all(&dir2).map_err(|e| e.to_string())?;
         let data = dir2.join("data.jsonl");
-        std::fs::write(&data, ds.to_jsonl()).map_err(|e| e.to_string())?;
+        std::fs::write(&data, if meta.params.dpo() { ds.pairs_jsonl() } else { ds.to_jsonl() }).map_err(|e| e.to_string())?;
         let cfg = train::config_json(&meta.base_repo, &data, &dir2, &meta.params);
         std::fs::write(dir2.join("train.json"), serde_json::to_vec_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
         let started = std::time::Instant::now();

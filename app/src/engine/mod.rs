@@ -3,6 +3,7 @@
 
 pub mod arena;
 pub mod bench;
+pub mod datakit;
 pub mod dataset;
 pub mod fit;
 pub mod gpu;
