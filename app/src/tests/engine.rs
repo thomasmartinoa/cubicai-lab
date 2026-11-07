@@ -154,7 +154,7 @@ fn server_starts_answers_and_stops() {
 
     // Chat through it like the app does.
     let (tx, rx) = std::sync::mpsc::channel();
-    let req = crate::llm::Request { base_url: s.base_url(), key: String::new(), model: "tiny".into(), messages: vec![serde_json::json!({"role":"user","content":"hi"})], local: true };
+    let req = crate::llm::Request { base_url: s.base_url(), key: String::new(), model: "tiny".into(), messages: vec![serde_json::json!({"role":"user","content":"hi"})], local: true, ..Default::default() };
     crate::llm::stream(req, 1, tx, Default::default(), egui::Context::default());
     let mut reply = String::new();
     let mut tps = 0.0;

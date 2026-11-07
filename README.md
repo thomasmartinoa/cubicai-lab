@@ -8,6 +8,17 @@ The desktop side of [CubicAI](../cubicai): chat with local and cloud models, run
 
 **Chat.** Uses the same providers as the phone (this PC through llama.cpp, Ollama, Gemini, Grok, OpenRouter, or any OpenAI-compatible server), the same behaviours and "About you", and the same chat file format. Replies stream with their reasoning, speed and token counts. You can edit, regenerate, search and rename chats.
 
+**Arena.** Put 2–4 models side by side:
+- Any mix of GGUF files on llama.cpp, fine-tuned adapters, Ollama models and cloud models (Gemini, Grok, OpenRouter, your own server).
+- One prompt or a saved prompt set, with the same system prompt, temperature and length for everyone.
+- Each answer shows time to first token, speed, length, total time and the GPU memory its model used, with the best figures marked. "Highlight what differs" marks the words an answer doesn't share with the first one.
+- Cloud models answer at the same time. Models on this PC take turns, and the GPU is handed over between Ollama and llama.cpp first, so each one gets it to itself and loading isn't counted.
+- Vote for the best answer, blind if you like (shuffled A/B/C until you vote). A leaderboard turns your votes into Elo ratings.
+- An AI judge (any model) can score every answer out of 10 against your rubric. The Lab shows how often it agreed with you.
+- "+ other quants" adds the same model's other quantisations, to weigh quality against speed and memory.
+
+![Three models on one question, with the judge's pick](docs/screenshots/arena.png)
+
 **Engine Room.**
 - Installs and updates llama.cpp from its GitHub releases, picking the right build for your GPU (CUDA 13/12, Vulkan, ROCm, Metal or CPU).
 - Shows your VRAM and what is using it, and can unload Ollama to free it.
@@ -80,7 +91,7 @@ Rust 1.90+ (edition 2024). On Linux you need the usual windowing libraries (Wayl
 cargo test --workspace --release
 ```
 
-**Offline (158 tests, a few seconds).**
+**Offline (174 tests, a few seconds).**
 - **GGUF:**
   - Every weight decoder is checked against gguf-py's output, using fixtures in `crates/gguf/tests/fixtures`.
   - A small model written byte by byte checks the parser, the layer layout, the KV-cache shape, the statistics and the zoom windows against exact values.
@@ -117,6 +128,12 @@ cargo test --workspace --release
   - datasets (validity, JSONL, forgiving parsing of drafted replies, chats as examples);
   - the trainer's events, and a whole run with a stand-in trainer (stopping, errors, conversion);
   - the per-request adapter switch.
+- **Arena:**
+  - word differences (joined back exactly, case ignored, long answers by line) and how similar two answers are;
+  - stable blind orders, the GPU lane's order (Ollama first, one model at a time), and speed from timings or tokens;
+  - the judge's prompt (only working answers, blind letters, no names) and verdicts in the shapes models write;
+  - Elo from votes, draws, failed answers left out, the judge's averages and agreement;
+  - quantisations read from names, and runs and prompt sets saved and loaded.
 - **Gateway:**
   - who may connect (home network, the PC's own IPv6 prefixes, Tailscale only with remote on), and which addresses count as public;
   - the pairing link and tool-call arguments, byte for byte against the Python gateway;
@@ -134,6 +151,7 @@ LLAMA_DIR=/tmp/llama MODEL_PATH=/path/model.gguf \
                                                                       # our forward pass vs llama.cpp, a steering vector, benchmark
 LLAMA_DIR=/tmp/llama MODEL_PATH=/path/llama-3.1-8b.gguf \
   cargo test --release net_real_train -- --ignored --nocapture        # sets up the trainer, trains an adapter, checks it in llama.cpp
+cargo test --release net_arena -- --ignored --nocapture                 # the Arena: llama.cpp vs Ollama vs another model, judged (LLAMA_BIN=<llama-server folder>)
 cargo test -p cubic-gateway --release real_ollama -- --ignored --nocapture
                                                                       # the gateway on a spare port with the real Ollama and SearXNG: models, a chat, a live search
 cargo test -p cubicai-lab --release live_panel -- --ignored --nocapture
@@ -156,7 +174,7 @@ SHOTS=/tmp/s MODEL=gpt-oss TENSOR=blk.5.ffn_down_exps.weight \
   - `--example next -- model.gguf "The capital of France is"` prints next-token odds
   - `--example steer -- llama3.gguf 0 0.25 -0.25` builds a joyful/gloomy vector and writes with it, all on the CPU
 - `crates/gateway`: the phone's private gateway (`cubicai-gateway serve`), a Rust port of the Python gateway the CubicAI repo used to have, with the same protocol and pairing: TLS 1.3 to a pinned certificate, the pairing token, home-network and Tailscale rules, chat through Ollama, web search through SearXNG, creating pictures, video, music and speech through ComfyUI, and live voice calls (Silero VAD, Parakeet, Kokoro on ONNX Runtime; `cubicai-gateway voice-setup` fetches what they need).
-- `app/src/engine`: GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs, and the LoRA converter.
+- `app/src/engine`: the Arena (runs, judge, leaderboard, differences), GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs, and the LoRA converter.
 - `app/src/phone.rs`: the phone gateway's control panel (service, Ollama, search, pairing, activity), gathered off the UI thread.
 - `app/src/ui`: chat, engine room, anatomy, X-ray, steering, fine-tune, phone, settings. `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 

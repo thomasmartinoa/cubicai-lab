@@ -105,6 +105,60 @@ fn shots() {
     settle(&mut h, 600, |_| false);
     save(&mut h, "chat");
 
+    // The Arena with a sample comparison (in memory only).
+    {
+        use crate::engine::arena::{Answer, Judge, Run, Verdict, Vote, Who};
+        let app = h.state_mut();
+        let who = vec![
+            Who::Library { key: "k1".into(), name: "Llama-3.1-8B-Instruct-Q4_K_M".into() },
+            Who::Provider { provider: "ollama".into(), model: "qwen3.5:4b".into() },
+            Who::Provider { provider: "gemini".into(), model: "gemini-3.5-flash".into() },
+        ];
+        let mut run = Run::new("Explain KV cache", who, vec![("In two sentences: what is the KV cache in a transformer, and why does it use so much memory?".into(), String::new())]);
+        let a = |text: &str, first: u64, took: u64, tok: u64, vram: Option<u64>, score: f32| Answer { text: text.into(), done: true, first_ms: Some(first), took, output_tokens: tok, vram, score: Some(score), ..Default::default() };
+        run.items[0].answers = vec![
+            a("The KV cache stores the keys and values of every earlier token so the model doesn't recompute them for each new token. It grows with the context length, layers and heads, so long chats fill memory fast.", 180, 1500, 52, Some(5_900_000_000), 8.0),
+            a("The KV cache keeps the attention keys and values of past tokens so each new token only computes its own. It uses a lot of memory because it grows with every token, for every layer.", 95, 1100, 44, Some(4_000_000_000), 7.0),
+            a("It's the stored attention **keys and values** for all previous tokens, which lets generation reuse them instead of recomputing. Its size is layers × heads × head size × context × 2, so it grows linearly with context and can rival the weights.", 420, 1900, 61, None, 9.0),
+        ];
+        run.items[0].answers[0].reasoning = "Keys and values per layer...".into();
+        run.items[0].vote = Some(Vote { best: Some(2), all_bad: false, at: 1 });
+        run.items[0].verdict = Some(Verdict { best: Some(2), why: "C gives the size formula and is still short.".into(), error: None });
+        run.judge = Some(Judge { provider: "xai".into(), model: "grok-4.7".into(), ..Default::default() });
+        app.arena.open = Some(run.id.clone());
+        app.arena.runs.insert(0, run);
+        app.arena.view = crate::ui::arena::View::Run;
+        app.tab = Tab::Arena;
+    }
+    settle(&mut h, 600, |_| false);
+    save(&mut h, "arena");
+    h.state_mut().arena.diff = true;
+    settle(&mut h, 300, |_| false);
+    save(&mut h, "arena-diff");
+    h.state_mut().arena.diff = false;
+    h.state_mut().arena.view = crate::ui::arena::View::Board;
+    settle(&mut h, 300, |_| false);
+    save(&mut h, "arena-board");
+    {
+        use crate::engine::arena::Who;
+        let app = h.state_mut();
+        app.arena.view = crate::ui::arena::View::Setup;
+        app.arena.draft.contestants = vec![Who::Provider { provider: "ollama".into(), model: "llama3.1:8b".into() }, Who::Provider { provider: "xai".into(), model: "grok-4.7".into() }];
+        app.arena.draft.prompt = "Write a limerick about a GPU that ran out of memory.".into();
+        app.arena.draft.judge_on = true;
+        app.arena.draft.judge.provider = "gemini".into();
+        app.arena.draft.judge.model = "gemini-3.5-flash".into();
+    }
+    settle(&mut h, 300, |_| false);
+    save(&mut h, "arena-setup");
+    {
+        let app = h.state_mut();
+        let id = app.arena.runs[0].id.clone();
+        app.arena.runs.retain(|r| r.id != id);
+        app.arena.draft = Default::default();
+        app.tab = Tab::Chat;
+    }
+
     h.state_mut().tab = Tab::Engine;
     let key = std::env::var("MODEL").ok().and_then(|m| h.state_mut().library.models.iter().find(|x| x.name.contains(&m)).map(|x| x.key.clone()));
     h.state_mut().engine_ui.selected = key.clone();
@@ -431,6 +485,7 @@ mod net {
             model,
             messages: vec![serde_json::json!({"role": "user", "content": "Say hello in five words."})],
             local: true,
+            ..Default::default()
         };
         crate::llm::stream(req, 1, tx, cancel, egui::Context::default());
         let (mut content, mut reasoning) = (String::new(), String::new());
@@ -494,6 +549,7 @@ mod real {
             model: "real".into(),
             messages: vec![serde_json::json!({"role": "user", "content": "In one sentence: what is a GGUF file?"})],
             local: true,
+            ..Default::default()
         };
         crate::llm::stream(req, 1, tx, Default::default(), egui::Context::default());
         let (mut reply, mut thought) = (String::new(), 0usize);
@@ -719,5 +775,57 @@ mod real {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(after.starts_with("Ahoy"), "the adapter's habit shows");
         assert!(!before.starts_with("Ahoy"), "and the base model doesn't have it");
+    }
+    /// The Arena end to end on this PC: llama3.1:8b on llama.cpp against the same model on Ollama
+    /// and qwen3.5:4b, with gemma4:e4b judging. The run is deleted afterwards.
+    #[test]
+    #[ignore]
+    fn net_arena() {
+        use crate::engine::arena::{Judge, Run, Who};
+        let mut h = super::harness(egui::Theme::Dark);
+        super::settle(&mut h, 3000, |a| !a.library.models.is_empty());
+        let app = h.state_mut();
+        // In memory only: the llama.cpp the other live tests installed (LLAMA_BIN, the folder with llama-server).
+        app.settings.llama_custom_dir = Some(std::path::PathBuf::from(std::env::var("LLAMA_BIN").unwrap_or("/tmp/cubic-llama/b12173-cuda-13/llama-b12173".into())));
+        let lib = app.library.models.iter().find(|m| m.name.contains("llama3.1")).expect("llama3.1 in the library").clone();
+        let who = vec![
+            Who::Library { key: lib.key.clone(), name: crate::app::short_model_name(&lib.name) },
+            Who::Provider { provider: "ollama".into(), model: "llama3.1:8b".into() },
+            Who::Provider { provider: "ollama".into(), model: "qwen3.5:4b".into() },
+        ];
+        let mut run = Run::new("net_arena", who, vec![("Name three primary colours, comma separated.".into(), String::new()), ("What is 12 times 11? Just the number.".into(), "132".into())]);
+        run.temperature = 0.0;
+        run.judge = Some(Judge { provider: "ollama".into(), model: "gemma4:e4b".into(), rubric: crate::engine::arena::RUBRIC.into() });
+        let id = run.id.clone();
+        app.arena.runs.insert(0, run);
+        crate::ui::arena::start(app, &id, true);
+        let started = std::time::Instant::now();
+        super::settle(&mut h, 600_000, |a| a.arena.live.is_none());
+        println!("took {:.1} s", started.elapsed().as_secs_f32());
+        let app = h.state_mut();
+        let run = app.arena.runs.iter().find(|r| r.id == id).unwrap().clone();
+        app.arena_store.delete_run(&id);
+        app.settings.llama_custom_dir = None;
+        app.server.stop();
+        for (i, it) in run.items.iter().enumerate() {
+            for (c, a) in it.answers.iter().enumerate() {
+                println!("{i}/{c} {:40} first {:?} took {} tok {:?} speed {:?} vram {:?} score {:?} err {:?}: {:?}", run.contestants[c].label(), a.first_ms, a.took, a.tokens(), a.speed(), a.vram.map(crate::widgets::fmt_bytes), a.score, a.error, a.text.chars().take(80).collect::<String>());
+            }
+            println!("   verdict {:?}", it.verdict);
+        }
+        assert!(run.finished());
+        for it in &run.items {
+            for a in &it.answers {
+                assert!(a.ok(), "{a:?}");
+                assert!(a.first_ms.is_some());
+                assert!(a.vram.is_some(), "local models report their GPU memory");
+            }
+            let v = it.verdict.as_ref().expect("judged");
+            assert!(v.error.is_none(), "{v:?}");
+            assert!(it.answers.iter().all(|a| a.score.is_some()));
+        }
+        assert!(run.items[1].answers.iter().all(|a| a.text.contains("132")));
+        assert!(run.summary().iter().all(|s| s.speed.is_some()), "every model wrote enough somewhere to time it");
+        assert!(app.arena_store.runs().iter().all(|r| r.id != id));
     }
 }

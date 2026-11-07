@@ -102,6 +102,19 @@ fn nvidia(nvml: &nvml_wrapper::Nvml) -> Option<GpuInfo> {
     })
 }
 
+/// The program a process runs, as started (Linux: the first word of /proc/<pid>/cmdline, which
+/// unlike /proc/<pid>/exe is readable for other users' processes, such as Ollama's), or "".
+pub fn process_exe(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(b) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            return String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or_default()).into_owned();
+        }
+    }
+    let _ = pid;
+    String::new()
+}
+
 fn process_name(pid: u32) -> String {
     #[cfg(target_os = "linux")]
     {

@@ -94,6 +94,7 @@ fn run_stream(base_url: String) -> Vec<Ev> {
         model: "tiny".into(),
         messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
         local: true,
+        ..Default::default()
     };
     llm::stream(req, 7, tx, Arc::new(AtomicBool::new(false)), egui::Context::default());
     let mut out = vec![];

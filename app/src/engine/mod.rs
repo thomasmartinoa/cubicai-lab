@@ -1,6 +1,7 @@
 //! The Engine Room's machinery: llama.cpp builds, the model library, the running server, GPU
 //! monitoring, benchmarks and downloads. The UI lives in `ui/engine.rs`.
 
+pub mod arena;
 pub mod bench;
 pub mod dataset;
 pub mod fit;

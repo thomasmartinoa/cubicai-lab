@@ -14,6 +14,7 @@ use std::time::Instant;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Chat,
+    Arena,
     Engine,
     Anatomy,
     XRay,
@@ -77,6 +78,8 @@ pub struct App {
     pub steer: ui::steer::SteerUi,
     pub steer_store: engine::steer::Store,
     pub tune: ui::tune::TuneUi,
+    pub arena: ui::arena::ArenaUi,
+    pub arena_store: engine::arena::Store,
     pub datasets: engine::dataset::Store,
     pub adapters: engine::train::Adapters,
     pub train_env: engine::train::Env,
@@ -100,6 +103,8 @@ impl App {
         let adapters = engine::train::Adapters::new(paths.tuning.join("adapters"));
         let train_env = engine::train::Env::new(paths.tuning.join("env"));
         let tune = ui::tune::TuneUi::new(datasets.list(), adapters.list());
+        let arena_store = engine::arena::Store::new(paths.data.join("arena"));
+        let arena = ui::arena::ArenaUi::new(arena_store.runs(), arena_store.sets());
         let (tx, rx) = channel();
         let mut app = App {
             chat: ChatState {
@@ -126,6 +131,8 @@ impl App {
             steer,
             steer_store,
             tune,
+            arena,
+            arena_store,
             datasets,
             adapters,
             train_env,
@@ -426,13 +433,19 @@ impl App {
 
     /// A request to a provider with its saved model and key (shared by chat and helpers).
     pub fn provider_request(&mut self, provider_id: &str, messages: Vec<serde_json::Value>) -> Result<llm::Request, String> {
+        self.request_for(provider_id, None, messages)
+    }
+
+    /// A request to a provider with a given model (None: the one saved for it), and its key.
+    pub fn request_for(&mut self, provider_id: &str, model: Option<&str>, messages: Vec<serde_json::Value>) -> Result<llm::Request, String> {
         let provider = providers::get(provider_id);
+        let saved = || self.settings.models.get(provider.id).cloned().unwrap_or_default();
         let (base_url, model, local) = if provider.id == providers::PC {
             (self.server.base_url(), self.server.model_name.clone(), true)
         } else if provider.id == "custom" {
-            (self.settings.custom_base_url.clone(), self.settings.models.get("custom").cloned().unwrap_or_default(), false)
+            (self.settings.custom_base_url.clone(), model.map(str::to_string).unwrap_or_else(saved), false)
         } else {
-            (provider.base_url.to_string(), self.settings.models.get(provider.id).cloned().unwrap_or_default(), provider.id == "ollama")
+            (provider.base_url.to_string(), model.map(str::to_string).unwrap_or_else(saved), provider.id == "ollama")
         };
         if model.is_empty() {
             return Err("Choose a model first.".into());
@@ -444,7 +457,7 @@ impl App {
         if provider.needs_key && key.is_empty() && provider.id != "custom" {
             return Err(format!("Add your {} API key in Settings.", provider.short));
         }
-        Ok(llm::Request { base_url, key, model, messages, local })
+        Ok(llm::Request { base_url, key, model, messages, local, ..Default::default() })
     }
 
     pub fn stop(&mut self) {
@@ -621,6 +634,7 @@ impl eframe::App for App {
         self.server.poll();
         ui::steer::pump(self, &ctx);
         ui::tune::pump(self, &ctx);
+        ui::arena::pump(self, &ctx);
         if self.server.state() == engine::server::State::Loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -631,6 +645,7 @@ impl eframe::App for App {
         self.xray.stop();
         self.steer.stop();
         self.tune.stop();
+        self.arena.stop();
         self.server.stop();
         self.save_settings();
     }

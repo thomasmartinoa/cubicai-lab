@@ -17,7 +17,7 @@ pub enum Ev {
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Request {
     pub base_url: String,
     pub key: String,
@@ -25,6 +25,8 @@ pub struct Request {
     pub messages: Vec<Value>,
     /// llama-server: the reasoning arrives as `reasoning_content`; ask for timings too.
     pub local: bool,
+    /// More fields for the request body (temperature, max_tokens, llama-server's `lora`…).
+    pub extra: serde_json::Map<String, Value>,
 }
 
 pub fn agent(connect_secs: u64) -> ureq::Agent {
@@ -56,12 +58,15 @@ pub fn stream(req: Request, job: u64, tx: Sender<(u64, Ev)>, cancel: Arc<AtomicB
 }
 
 fn run(req: &Request, cancel: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), String> {
-    let body = json!({
+    let mut body = json!({
         "model": req.model,
         "messages": req.messages,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    for (k, v) in &req.extra {
+        body[k] = v.clone();
+    }
     let url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
     let agent = agent(if req.local { 5 } else { 20 });
     let mut r = agent.post(&url).header("Accept", "text/event-stream");

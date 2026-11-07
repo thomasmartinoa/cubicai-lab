@@ -1,6 +1,7 @@
 //! The window: a top bar with the brand mark, tabs and the server status, then the open screen.
 
 pub mod anatomy;
+pub mod arena;
 pub mod chat;
 pub mod engine;
 pub mod phone;
@@ -23,9 +24,9 @@ pub fn frame(app: &mut App, ui: &mut egui::Ui) {
         .frame(egui::Frame::new().fill(p.lowest).inner_margin(egui::Margin::symmetric(16, 8)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let spinning = app.busy() || app.xray.busy() || app.steer.busy() || app.tune.busy() || app.server.state() == State::Loading;
+                let spinning = app.busy() || app.xray.busy() || app.steer.busy() || app.tune.busy() || app.arena.busy() || app.server.state() == State::Loading;
                 // What fits decides what shows: the brand's words and the server's words give way first, then the tabs scroll.
-                let tabs = [(Tab::Chat, "Chat"), (Tab::Engine, "Engine Room"), (Tab::Anatomy, "Anatomy"), (Tab::XRay, "X-ray"), (Tab::Steering, "Steering"), (Tab::Tune, "Fine-tune"), (Tab::Phone, "Phone"), (Tab::Settings, "Settings")];
+                let tabs = [(Tab::Chat, "Chat"), (Tab::Arena, "Arena"), (Tab::Engine, "Engine Room"), (Tab::Anatomy, "Anatomy"), (Tab::XRay, "X-ray"), (Tab::Steering, "Steering"), (Tab::Tune, "Fine-tune"), (Tab::Phone, "Phone"), (Tab::Settings, "Settings")];
                 let gap = ui.spacing().item_spacing.x;
                 let tabs_w: f32 = tabs.iter().map(|(_, l)| tab_size(ui, l).x + gap).sum();
                 let brand_w = 24.0 + text_width(ui, "CubicAI", theme::heading(19.0)) + text_width(ui, "Lab", theme::heading(19.0)) + 3.0 * gap + 18.0;
@@ -80,6 +81,7 @@ pub fn frame(app: &mut App, ui: &mut egui::Ui) {
     }
     egui::CentralPanel::no_frame().show(ui, |ui| match app.tab {
         Tab::Chat => chat::show(app, ui),
+        Tab::Arena => arena::show(app, ui),
         Tab::Engine => engine::show(app, ui),
         Tab::Anatomy => anatomy::show(app, ui),
         Tab::XRay => xray::show(app, ui),
