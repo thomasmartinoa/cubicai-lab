@@ -2,6 +2,7 @@
 
 mod arena;
 mod datakit;
+mod desktop;
 mod engine;
 mod llm;
 mod phone;

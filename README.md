@@ -49,60 +49,29 @@ llama.cpp itself is **not** needed beforehand: the Engine Room downloads the rig
 git clone https://github.com/thomasmartinoa/cubicai-lab.git
 cd cubicai-lab
 cargo build --release
-install -Dm755 target/release/cubicai-lab ~/.local/bin/cubicai-lab
+target/release/cubicai-lab install
 ```
 
-That builds two programs: `cubicai-lab` (the desktop app) and `cubicai-gateway` (the phone gateway; only needed if you use the CubicAI phone app, see [Phone](#phone)).
+That builds two programs, `cubicai-lab` (the desktop app) and `cubicai-gateway` (the phone gateway; only needed if you use the CubicAI phone app, see [Phone](#phone)). `cubicai-lab install` then:
+- copies the app to `~/.local/bin/cubicai-lab`;
+- adds **CubicAI Lab** to your app menu with the CubicAI cube icon;
+- adds **CubicAI Server** (opens the Phone tab, with *Pair a phone* and *Activity* shortcuts) once the phone gateway is installed.
 
-Run it with `cubicai-lab`. Optional arguments open straight to the phone panel: `cubicai-lab phone`, `cubicai-lab pair`, `cubicai-lab activity`.
+Start it from the menu or with `cubicai-lab`. `cubicai-lab phone`, `cubicai-lab pair` and `cubicai-lab activity` open straight to the phone panel.
 
 ### Launchers
 
-To get the Lab in your app menu, save this as `~/.local/share/applications/cubicai-lab.desktop` (replace `YOU` with your user name):
+The menu entries (`~/.local/share/applications/cubicai-lab.desktop`, `cubicai-server.desktop`) and icons (`~/.local/share/icons/hicolor/scalable/apps/cubicai-lab.svg`, `cubicai-server.svg`) are written by `install` and kept up to date by the installed app each time it starts, so a new icon or a moved program reaches the menu by itself. Each window has its own app id (`cubicai-lab`, or `cubicai-server` for the phone panel), so docks and task switchers show the matching icon.
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=CubicAI Lab
-Comment=Chat, compare, inspect and fine-tune models
-Exec=/home/YOU/.local/bin/cubicai-lab
-Icon=applications-science
-Terminal=false
-Categories=Development;Science;
-StartupWMClass=cubicai-lab
-```
-
-And, if you use the phone app, a second one that opens the gateway panel, `~/.local/share/applications/cubicai-server.desktop`:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=CubicAI Server
-Comment=The CubicAI phone gateway: status, pairing, remote access, activity
-Exec=/home/YOU/.local/bin/cubicai-lab phone
-Icon=network-server
-Terminal=false
-Categories=Network;Utility;
-StartupWMClass=cubicai-lab
-Actions=pair;activity;
-
-[Desktop Action pair]
-Name=Pair a phone
-Exec=/home/YOU/.local/bin/cubicai-lab pair
-
-[Desktop Action activity]
-Name=Activity
-Exec=/home/YOU/.local/bin/cubicai-lab activity
-```
+To remove them: delete those four files (and `~/.local/bin/cubicai-lab`). The app menu (Linux, freedesktop) is the only platform `install` handles; on Windows and macOS, run the program where it is.
 
 ### Updating
 
 ```sh
-cd cubicai-lab && git pull && cargo build --release
-cp target/release/cubicai-lab ~/.local/bin/cubicai-lab.new && mv ~/.local/bin/cubicai-lab.new ~/.local/bin/cubicai-lab
+cd cubicai-lab && git pull && cargo build --release && target/release/cubicai-lab install
 ```
 
-Copy-then-rename replaces the file without disturbing a copy that's running; restart the Lab to use the new one. Your chats, datasets, adapters and settings are kept. To update the phone gateway, use **Update** in the Phone tab (or `target/release/cubicai-gateway install`).
+`install` replaces the program without disturbing a copy that's running; restart the Lab to use the new one. Your chats, datasets, adapters and settings are kept. To update the phone gateway, use **Update** in the Phone tab (or `target/release/cubicai-gateway install`).
 
 ## First run
 
@@ -303,6 +272,7 @@ On Linux (Windows and macOS use their usual app folders):
 | Trainer environment | `~/.local/share/cubicai-lab/tuning/env` (delete it to reinstall) |
 | Base models for training | the Hugging Face cache, `~/.cache/huggingface` |
 | Phone gateway | `~/.config/cubicai-server` (identity, token, settings), `~/.local/bin/cubicai-gateway` |
+| Menu entries and icons | `~/.local/share/applications/cubicai-{lab,server}.desktop`, `~/.local/share/icons/hicolor/scalable/apps/cubicai-{lab,server}.svg` |
 
 ## Troubleshooting
 
@@ -320,12 +290,13 @@ On Linux (Windows and macOS use their usual app folders):
 | AI grading misses obvious mistakes | Use a stronger grader. llama3.1:8b called 7 × 6 = 42 wrong; gemma4:e4b and the cloud models got it right. |
 | Report card: "No held-back questions" | Overview → Test split → Hold back 10%, then train again, so the questions are new to the model. |
 | The Arena or judge is slow | Local models take turns on the GPU. A judge on Ollama gets the GPU after the answers; a cloud judge doesn't need it. |
+| The menu shows no CubicAI entries, or old icons | Run `cubicai-lab install` again. Some launchers only rescan when restarted. |
 | The phone can't connect | Phone tab → **Phone can't connect?**, and the [CubicAI troubleshooting table](https://github.com/thomasmartinoa/cubicai#troubleshooting). |
 
 ## For developers
 
 ```sh
-cargo test --workspace --release        # 191 offline tests, a few seconds
+cargo test --workspace --release        # 195 offline tests, a few seconds
 cargo clippy --workspace --all-targets
 ```
 
@@ -339,6 +310,7 @@ Layout:
 - `crates/gateway`: the phone's gateway (`cubicai-gateway serve|pair|remote on/off|rotate|voice-setup|install`): TLS 1.3 to a pinned certificate, the pairing token, home-network and Tailscale rules, chat through Ollama, web search through SearXNG, pictures, video, music and speech through ComfyUI, and live voice calls (Silero VAD, Parakeet, Kokoro on ONNX Runtime).
 - `app/src/engine`: the Arena (runs, judge, leaderboard, report card), the dataset builder (`datakit`), GPU monitor, llama.cpp releases and install, server process, model library (folders + Ollama store), memory fit, benchmark, Hugging Face, X-ray client, steering vectors, datasets, the trainer environment and runs (`train.py`), and the LoRA converter.
 - `app/src/phone.rs`: the gateway's control panel data, gathered off the UI thread.
+- `app/src/desktop.rs` and `app/assets/icons`: `cubicai-lab install`, the app-menu entries and their icons (the phone app's cube on a cut-corner tile).
 - `app/src/ui`: one file per tab (`build.rs` is the dataset builder). `widgets.rs` and `theme.rs` hold CubicAI's look: cobalt and amber, cut corners, Chakra Petch headings.
 
 ## Fonts

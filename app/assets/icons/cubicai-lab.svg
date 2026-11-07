@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <!-- CubicAI Lab: the CubicAI cube (same geometry as the phone app's icon) on a cut-corner navy tile. -->
+  <path fill="#161B33" d="M22,4 H86 L104,22 V86 L86,104 H22 L4,86 V22 Z"/>
+  <path fill="none" stroke="#2D3765" stroke-width="2" d="M22.4,5 H85.6 L103,22.4 V85.6 L85.6,103 H22.4 L5,85.6 V22.4 Z"/>
+  <g transform="translate(54 54) scale(1.45) translate(-54 -55)">
+    <path fill="#FFC861" d="M54,31 L74.78,43 L54,55 L33.22,43 Z"/>
+    <path fill="#F29E38" d="M33.22,43 L54,55 L54,79 L33.22,67 Z"/>
+    <path fill="#C46F1C" d="M54,55 L74.78,43 L74.78,67 L54,79 Z"/>
+    <path fill="none" stroke="#161B33" stroke-width="1.6" d="M54,55 L33.22,43 M54,55 L74.78,43 M54,55 L54,79"/>
+  </g>
+</svg>

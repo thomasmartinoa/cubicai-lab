@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod desktop;
 mod engine;
 mod llm;
 mod personas;
@@ -21,10 +22,31 @@ mod shots;
 mod tests;
 
 fn main() -> eframe::Result {
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "install" {
+        if !cfg!(target_os = "linux") {
+            eprintln!("`install` sets up the Linux app menu; on this system, run the program where it is.");
+            std::process::exit(1);
+        }
+        match desktop::install() {
+            Ok(report) => println!("{report}"),
+            Err(e) => {
+                eprintln!("Couldn't install: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if cfg!(target_os = "linux") {
+        std::thread::spawn(desktop::refresh);
+    }
+    // Opened as the phone gateway's panel, the window is "CubicAI Server" to the desktop (its own
+    // menu entry and icon).
+    let server = app::start_view(&arg).is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("CubicAI Lab")
-            .with_app_id("cubicai-lab")
+            .with_title(if server { "CubicAI Server" } else { "CubicAI Lab" })
+            .with_app_id(if server { desktop::SERVER_ID } else { desktop::LAB_ID })
             .with_inner_size([1380.0, 880.0])
             .with_min_inner_size([960.0, 620.0])
             .with_icon(icon()),
@@ -33,12 +55,15 @@ fn main() -> eframe::Result {
     eframe::run_native("CubicAI Lab", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }
 
-/// The cube mark drawn into a 128 px window icon.
+/// The window icon, drawn like `assets/icons/cubicai-lab.svg`: the cube on a cut-corner navy tile.
 fn icon() -> egui::IconData {
     let n = 128usize;
     let mut rgba = vec![0u8; n * n * 4];
     let [top, left, right] = theme::DARK.cube;
-    let r = n as f32 * 0.46;
+    let bg = theme::DARK.bg;
+    let edge = theme::DARK.variant;
+    let u = n as f32 / 108.0;
+    let r = 24.0 * 1.45 * u;
     let (cx, cy) = (n as f32 / 2.0, n as f32 / 2.0);
     let dx = r * 3f32.sqrt() / 2.0;
     let quad = |px: f32, py: f32, pts: [(f32, f32); 4]| {
@@ -59,6 +84,11 @@ fn icon() -> egui::IconData {
         }
         true
     };
+    // The tile: a square 4..104 with 18-unit cut corners; its edge 1.5 units wide.
+    let tile = |px: f32, py: f32, inset: f32| {
+        let (ax, ay) = ((px - cx).abs() / u, (py - cy).abs() / u);
+        ax <= 50.0 - inset && ay <= 50.0 - inset && ax + ay <= 82.0 - inset * 1.414
+    };
     let t = (cx, cy - r);
     let ur = (cx + dx, cy - r / 2.0);
     let dr = (cx + dx, cy + r / 2.0);
@@ -75,6 +105,10 @@ fn icon() -> egui::IconData {
                 Some(left)
             } else if quad(px, py, [c, ur, dr, b]) {
                 Some(right)
+            } else if tile(px, py, 1.5) {
+                Some(bg)
+            } else if tile(px, py, 0.0) {
+                Some(edge)
             } else {
                 None
             };
