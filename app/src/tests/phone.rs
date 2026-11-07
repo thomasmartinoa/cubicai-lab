@@ -94,7 +94,6 @@ fn launcher_arguments() {
     assert_eq!(start_view("activity"), Some(View::Activity));
     assert_eq!(start_view("phone"), Some(View::Status));
     assert_eq!(start_view("--whatever"), None);
-    assert!(phone::python_unit().ends_with("cubicai/server/cubicai-server.service"));
 }
 
 /// What a scanner reads from the code is exactly the link: drawn 8 px per module (as on screen,

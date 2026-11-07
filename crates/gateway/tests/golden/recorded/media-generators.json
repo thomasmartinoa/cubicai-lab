@@ -1,0 +1,313 @@
+[
+  {
+    "id": "qwen-uncensored",
+    "name": "Qwen Image 2.1 Uncensored",
+    "kind": "image",
+    "mode": "create",
+    "note": "Best quality, about 1½ min",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": true,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true,
+    "steps": {
+      "default": 32,
+      "min": 4,
+      "max": 60
+    },
+    "cfg": {
+      "default": 5.9,
+      "min": 1.0,
+      "max": 12.0
+    },
+    "negative_default": "fa8145fb9aa392b92373aaebd0d22fc6f3fe7d0efac659c066da4ef7a03bba3f"
+  },
+  {
+    "id": "z-image",
+    "name": "Z-Image Turbo",
+    "kind": "image",
+    "mode": "create",
+    "note": "Fast, about 25 s",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true
+  },
+  {
+    "id": "flux3-klein",
+    "name": "Flux 3 Klein",
+    "kind": "image",
+    "mode": "create",
+    "note": "Sharp detail, rewrites your prompt first, about 35 s",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true
+  },
+  {
+    "id": "flux2-klein",
+    "name": "Flux 2 Klein",
+    "kind": "image",
+    "mode": "create",
+    "note": "Fastest, about 10 s",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true
+  },
+  {
+    "id": "illustrious",
+    "name": "Illustrious XL (anime)",
+    "kind": "image",
+    "mode": "create",
+    "note": "Anime and illustration; use tags",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": true,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true,
+    "steps": {
+      "default": 28,
+      "min": 4,
+      "max": 60
+    },
+    "cfg": {
+      "default": 6,
+      "min": 1.0,
+      "max": 12.0
+    },
+    "negative_default": "e5a4d98c56b61261010f78a4ab4c7482b1b83eb4cd56d68115b7e949dc19bd97"
+  },
+  {
+    "id": "qwen-edit",
+    "name": "Qwen Image Edit",
+    "kind": "image",
+    "mode": "edit",
+    "note": "Describe the change to your photo, about 45 s",
+    "image": "required",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [],
+    "seed": true
+  },
+  {
+    "id": "flux2-edit",
+    "name": "Flux 2 Klein Edit",
+    "kind": "image",
+    "mode": "edit",
+    "note": "Quick edits to your photo, about 20 s",
+    "image": "required",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [],
+    "seed": true
+  },
+  {
+    "id": "cutout",
+    "name": "Remove background",
+    "kind": "image",
+    "mode": "tool",
+    "note": "Transparent PNG of the subject",
+    "image": "required",
+    "audio": "none",
+    "prompt": false,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [],
+    "seed": false
+  },
+  {
+    "id": "upscale",
+    "name": "Upscale 2×",
+    "kind": "image",
+    "mode": "tool",
+    "note": "Sharper, twice the size",
+    "image": "required",
+    "audio": "none",
+    "prompt": false,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [],
+    "seed": true
+  },
+  {
+    "id": "wan-5b",
+    "name": "Wan 2.2 5B",
+    "kind": "video",
+    "mode": "create",
+    "note": "Text or photo to video, about 1 min per second",
+    "image": "optional",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true,
+    "steps": {
+      "default": 20,
+      "min": 4,
+      "max": 60
+    },
+    "cfg": {
+      "default": 5,
+      "min": 1.0,
+      "max": 12.0
+    },
+    "seconds": {
+      "default": 3,
+      "max": 5
+    }
+  },
+  {
+    "id": "wan-14b",
+    "name": "Wan 2.2 14B",
+    "kind": "video",
+    "mode": "animate",
+    "note": "Brings your photo to life, about 1 min per second",
+    "image": "required",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [
+      "1:1",
+      "3:4",
+      "2:3",
+      "9:16",
+      "4:3",
+      "3:2",
+      "16:9"
+    ],
+    "seed": true,
+    "seconds": {
+      "default": 4,
+      "max": 5
+    }
+  },
+  {
+    "id": "ace-step",
+    "name": "ACE-Step 1.5",
+    "kind": "audio",
+    "mode": "music",
+    "note": "Describe the style; lyrics optional. About 15 s per minute",
+    "image": "none",
+    "audio": "none",
+    "prompt": true,
+    "negative": false,
+    "lyrics": true,
+    "aspects": [],
+    "seed": true,
+    "seconds": {
+      "default": 60,
+      "max": 240
+    }
+  },
+  {
+    "id": "chatterbox",
+    "name": "Chatterbox voice",
+    "kind": "audio",
+    "mode": "speech",
+    "note": "Reads your text aloud",
+    "image": "none",
+    "audio": "optional",
+    "prompt": true,
+    "negative": false,
+    "lyrics": false,
+    "aspects": [],
+    "seed": true,
+    "voices": [
+      "woman",
+      "man"
+    ],
+    "languages": [
+      "Arabic (ar)",
+      "Danish (da)",
+      "German (de)",
+      "Greek (el)",
+      "English (en)",
+      "Spanish (es)",
+      "Finnish (fi)",
+      "French (fr)",
+      "Hebrew (he)",
+      "Hindi (hi)",
+      "Italian (it)",
+      "Japanese (ja)",
+      "Korean (ko)",
+      "Malay (ms)",
+      "Dutch (nl)",
+      "Norwegian (no)",
+      "Polish (pl)",
+      "Portuguese (pt)",
+      "Russian (ru)",
+      "Swedish (sv)",
+      "Swahili (sw)",
+      "Turkish (tr)",
+      "Chinese (zh)"
+    ]
+  }
+]

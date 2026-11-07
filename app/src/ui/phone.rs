@@ -103,9 +103,6 @@ fn status_view(app: &mut App, ui: &mut egui::Ui, s: &Status) {
         ui.add_space(6.0);
         match kind {
             "Rust" => row(ui, "Runs the Rust gateway", "~/.local/bin/cubicai-gateway, built from this repo.", |ui| {
-                if phone::python_unit().is_file() && widgets::button(ui, Kind::Ghost, "Back to Python").clicked() {
-                    app.phone.act(&ctx, |_| phone::use_python());
-                }
                 if phone::gateway_binary().is_some() && widgets::button(ui, Kind::Ghost, "Update").on_hover_text("Install the gateway built next to this Lab and restart it").clicked() {
                     app.phone.act(&ctx, |_| phone::use_rust());
                 }

@@ -1,6 +1,7 @@
-//! The Rust voice against the Python one (`cubicai_voice.py` and the libraries it uses), on this
+//! The Rust voice against the Python one (`cubicai_voice.py` and the libraries it used), on this
 //! PC's real models: the words said, the sentences cut, the phonemes, the ASR features, Kokoro's
-//! audio and Parakeet's transcripts. Needs the CubicAI server's venv and the voice models.
+//! audio and Parakeet's transcripts. Python's answers are recorded (see [`python`]); the voice
+//! models must be installed (`cubicai-gateway voice-setup`).
 //! `cargo test -p cubic-gateway --release --test voice_golden -- --ignored --nocapture`
 
 use cubic_gateway::voice::{self, asr, phonemes::Espeak, text, tts, Engine};
@@ -8,27 +9,46 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
 
-fn server_dir() -> PathBuf {
-    std::env::var("CUBICAI_SERVER_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cubicai/server"))
+fn recorded(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/recorded").join(name)
 }
 
-fn python(mode: &str, input: &Value) -> Value {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/voice_golden.py");
-    let mut child = std::process::Command::new(server_dir().join(".venv/bin/python"))
-        .arg(&script)
-        .arg(server_dir())
-        .arg(mode)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("the server's venv");
-    child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    // The Python voice logs to stdout too: the answer is the last line.
-    let text = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(text.trim().lines().last().unwrap_or("null")).unwrap_or(Value::Null)
+/// What the Python voice gave for `mode`. The Python gateway is gone, so its answers (and the files
+/// it wrote, `files`: where the test expects each, and the name it's kept under) were recorded in
+/// `tests/golden/recorded`; `GOLDEN_RECORD=<old cubicai/server>` re-records them from a checkout that
+/// still has it and its venv. `key` is what the answer depends on, checked so changed cases can't
+/// silently compare against stale answers.
+fn python(mode: &str, input: &Value, key: &Value, files: &[(PathBuf, &str)]) -> Value {
+    let answer = recorded(&format!("voice-{mode}.json"));
+    if let Ok(server) = std::env::var("GOLDEN_RECORD") {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/voice_golden.py");
+        let mut child = std::process::Command::new(PathBuf::from(&server).join(".venv/bin/python"))
+            .arg(&script)
+            .arg(&server)
+            .arg(mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the old server's venv");
+        child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // The Python voice logs to stdout too: the answer is the last line.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let got: Value = serde_json::from_str(text.trim().lines().last().unwrap_or("null")).unwrap_or(Value::Null);
+        std::fs::create_dir_all(answer.parent().unwrap()).unwrap();
+        std::fs::write(&answer, json!({"key": key, "answer": got}).to_string()).unwrap();
+        for (made, name) in files {
+            std::fs::copy(made, recorded(name)).unwrap();
+        }
+    }
+    let saved: Value = serde_json::from_slice(&std::fs::read(&answer).expect("recorded Python output")).unwrap();
+    assert_eq!(&saved["key"], key, "{mode}: the cases changed since Python's answers were recorded");
+    for (made, name) in files {
+        std::fs::copy(recorded(name), made).unwrap();
+    }
+    saved["answer"].clone()
 }
 
 fn scratch() -> PathBuf {
@@ -78,11 +98,11 @@ fn segment_cases() -> Vec<Vec<&'static str>> {
 #[test]
 #[ignore]
 fn golden_text_matches_python() {
-    let py = python("speakable", &json!(SPEAKABLE));
+    let py = python("speakable", &json!(SPEAKABLE), &json!(SPEAKABLE), &[]);
     let rs: Vec<String> = SPEAKABLE.iter().map(|t| text::speakable(t)).collect();
     assert_eq!(json!(rs), py);
     let cases = segment_cases();
-    let py = python("segments", &json!(cases));
+    let py = python("segments", &json!(cases), &json!(cases), &[]);
     let rs: Vec<Value> = cases
         .iter()
         .map(|pieces| {
@@ -140,14 +160,14 @@ fn golden_phonemes_match_python() {
     let p = voice::Paths::from_env();
     let espeak = Espeak::load(&p.espeak_lib, &p.espeak_data).unwrap();
     let cases = phoneme_cases();
-    let py = python("phonemes", &json!(cases));
+    let py = python("phonemes", &json!(cases), &json!(cases), &[]);
     for (i, (t, lang)) in cases.iter().enumerate() {
         let rs = tts::keep_known(&espeak.phonemize(t.trim(), lang).unwrap());
         assert_eq!(json!(rs), py[i], "{lang}: {t:?}");
     }
     // The punctuation step on its own.
     let texts: Vec<&str> = cases.iter().map(|c| c.0).filter(|t| !t.is_empty()).collect();
-    let py = python("punct", &json!(texts));
+    let py = python("punct", &json!(texts), &json!(texts), &[]);
     for (i, t) in texts.iter().enumerate() {
         let (chunks, marks) = voice::phonemes::preserve(t);
         let marks: Vec<Value> = marks.iter().map(|m| json!([m.index, m.mark, m.position.to_string()])).collect();
@@ -156,7 +176,7 @@ fn golden_phonemes_match_python() {
     // Batches: a long reply is split at punctuation below 510 phonemes.
     let long = "həlˈoʊ, wˈɜːld! ".repeat(60) + &"ðɪs ɪz ɐ lˈɔŋ sˈɛntəns wɪðˌaʊt pˈʌŋktʃuːˌeɪʃən ".repeat(20);
     let splits = vec!["", "ɐ", "a, b. c! d? e; f", long.as_str()];
-    assert_eq!(json!(splits.iter().map(|s| tts::split_phonemes(s)).collect::<Vec<_>>()), python("split", &json!(splits)));
+    assert_eq!(json!(splits.iter().map(|s| tts::split_phonemes(s)).collect::<Vec<_>>()), python("split", &json!(splits), &json!(splits), &[]));
     println!("{} phoneme cases in {} languages match", cases.len(), 7);
 }
 
@@ -164,7 +184,7 @@ fn golden_phonemes_match_python() {
 #[ignore]
 fn golden_asr_features_match_python() {
     let dir = scratch();
-    python("bank", &json!({"out": dir.join("bank.f32")}));
+    python("bank", &json!({"out": dir.join("bank.f32")}), &json!("nemo128"), &[(dir.join("bank.f32"), "bank.f32")]);
     let py_bank = read_f32(&dir.join("bank.f32"));
     let bank = asr::mel_bank();
     assert_eq!(py_bank.len(), bank.len());
@@ -183,7 +203,12 @@ fn golden_asr_features_match_python() {
         })
         .collect();
     write_f32(&dir.join("audio.f32"), &audio);
-    let info = python("features", &json!({"audio": dir.join("audio.f32"), "onnx": dir.join("onnx.f32"), "numpy": dir.join("numpy.f32")}));
+    let info = python(
+        "features",
+        &json!({"audio": dir.join("audio.f32"), "onnx": dir.join("onnx.f32"), "numpy": dir.join("numpy.f32")}),
+        &json!({"samples": n, "seed": 12345}),
+        &[(dir.join("onnx.f32"), "features-onnx.f32"), (dir.join("numpy.f32"), "features-numpy.f32")],
+    );
     let (feats, frames, valid) = asr::features(&audio, &bank, &asr::Fft::new());
     assert_eq!(info["shape"], json!([1, 128, frames]));
     assert_eq!((info["len"].as_u64().unwrap() as usize, info["numpy_len"].as_u64().unwrap() as usize), (valid, valid));
@@ -205,7 +230,9 @@ fn golden_speech_and_transcripts_match_python() {
         ("The quick brown fox jumps over the lazy dog, twice.", "am_michael", 1.2),
         ("Hola, ¿cómo estás hoy?", "ef_dora", 0.9),
     ];
-    let py_lens = python("speak", &json!({"dir": dir, "lines": lines}));
+    let kept: Vec<(PathBuf, String)> = (0..lines.len()).map(|i| (dir.join(format!("py{i}.f32")), format!("speak{i}.f32"))).collect();
+    let kept: Vec<(PathBuf, &str)> = kept.iter().map(|(p, n)| (p.clone(), n.as_str())).collect();
+    let py_lens = python("speak", &json!({"dir": dir, "lines": lines}), &json!(lines), &kept);
     let t = std::time::Instant::now();
     let m = voice::models::Models::load(&voice::Paths::from_env()).unwrap();
     println!("models loaded in {:.1} s", t.elapsed().as_secs_f64());
@@ -225,7 +252,7 @@ fn golden_speech_and_transcripts_match_python() {
         write_f32(&p, &at16);
         paths.push(p);
     }
-    let py_text = python("transcribe", &json!(paths));
+    let py_text = python("transcribe", &json!(paths), &json!(lines), &[]);
     for (i, p) in paths.iter().enumerate() {
         let t = std::time::Instant::now();
         let rs = m.transcribe(&read_f32(p)).unwrap();

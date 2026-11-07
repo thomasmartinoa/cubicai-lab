@@ -1,19 +1,85 @@
-//! The media port against the Python gateway's own code, on this PC's real ComfyUI workflows.
-//! Needs the CubicAI repo beside this one, ComfyUI's workflows and the cached node list, so it's
-//! ignored by default: `cargo test -p cubic-gateway --release golden -- --ignored --nocapture`.
+//! The media port against the Python gateway's own outputs, on this PC's real ComfyUI workflows.
+//! The Python gateway is gone; what it made of each workflow was recorded in `tests/golden/recorded`
+//! (`GOLDEN_RECORD=<old cubicai/server>` re-records from a checkout that still has it). Needs ComfyUI's
+//! workflows and the cached node list, so it's ignored by default:
+//! `cargo test -p cubic-gateway --release golden -- --ignored --nocapture`.
 
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub fn server_dir() -> PathBuf {
-    std::env::var("CUBICAI_SERVER_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cubicai/server"))
+pub fn recorded(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/recorded").join(name)
 }
 
 pub fn python(what: &str) -> Value {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/media_golden.py");
-    let out = std::process::Command::new("python3").arg(&script).arg(server_dir()).arg(what).output().expect("python3");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    serde_json::from_slice(&out.stdout).expect("json")
+    let file = recorded(&format!("media-{what}.json"));
+    if let Ok(server) = std::env::var("GOLDEN_RECORD") {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/media_golden.py");
+        let out = std::process::Command::new("python3").arg(&script).arg(server).arg(what).output().expect("python3");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut answer: Value = serde_json::from_slice(&out.stdout).expect("json");
+        // The workflows hold the user's own prompts: only their fingerprints are kept.
+        if what == "to_api" {
+            answer = Value::Object(answer.as_object().unwrap().iter().map(|(k, v)| (k.clone(), seal_converted(v))).collect());
+        } else if what == "generators" {
+            answer = seal_defaults(&answer);
+        } else if what == "build" {
+            answer = Value::Object(answer.as_object().unwrap().iter().map(|(k, v)| (k.clone(), seal_nodes(v))).collect());
+        }
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, serde_json::to_vec_pretty(&answer).unwrap()).unwrap();
+    }
+    serde_json::from_slice(&std::fs::read(&file).expect("recorded Python output")).expect("json")
+}
+
+/// The value with its keys sorted at every level, so the same JSON always gives the same text.
+fn canonical(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            format!("{{{}}}", keys.iter().map(|k| format!("{}:{}", Value::from(k.as_str()), canonical(&m[*k]))).collect::<Vec<_>>().join(","))
+        }
+        Value::Array(a) => format!("[{}]", a.iter().map(canonical).collect::<Vec<_>>().join(",")),
+        _ => v.to_string(),
+    }
+}
+
+pub fn seal(v: &Value) -> Value {
+    Value::from(cubic_gateway::identity::fingerprint(canonical(v).as_bytes()))
+}
+
+/// A prompt (node id → node) as node id → fingerprint; an error stays as it is.
+pub fn seal_nodes(v: &Value) -> Value {
+    match v.get("error") {
+        Some(_) => v.clone(),
+        None => Value::Object(v.as_object().unwrap().iter().map(|(k, n)| (k.clone(), seal(n))).collect()),
+    }
+}
+
+/// The generator list with each workflow's own negative prompt as a fingerprint.
+pub fn seal_defaults(list: &Value) -> Value {
+    Value::from(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let mut g = g.clone();
+                if let Some(n) = g.get("negative_default").cloned() {
+                    g["negative_default"] = seal(&n);
+                }
+                g
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A converted workflow ({prompt, named} or {error}) with fingerprints in place of its contents.
+pub fn seal_converted(v: &Value) -> Value {
+    match v.get("error") {
+        Some(_) => v.clone(),
+        None => serde_json::json!({"prompt": seal_nodes(&v["prompt"]), "named": seal(&v["named"])}),
+    }
 }
 
 pub fn object_info() -> Value {
@@ -40,18 +106,20 @@ fn golden_to_api_matches_python_on_every_workflow() {
             }
             Err(e) => serde_json::json!({"error": format!("ValueError: {e}")}),
         };
+        let full = got.clone();
+        let got = seal_converted(&got);
         if &got != w {
             let (g, p) = (got["prompt"].as_object(), w["prompt"].as_object());
             if let (Some(g), Some(p)) = (g, p) {
                 for k in p.keys().chain(g.keys()) {
                     if g.get(k) != p.get(k) {
-                        println!("{name} node {k}:\n  rust   {}\n  python {}", g.get(k).map(|v| v.to_string()).unwrap_or_default(), p.get(k).map(|v| v.to_string()).unwrap_or_default());
+                        println!("{name} node {k} differs from Python's (fingerprint {}):\n  rust   {}", p.get(k).map(|v| v.to_string()).unwrap_or("missing".into()), full["prompt"].get(k).map(|v| v.to_string()).unwrap_or("missing".into()));
                         break;
                     }
                 }
             }
             if got["named"] != w["named"] {
-                println!("{name} named:\n  rust   {}\n  python {}", got["named"], w["named"]);
+                println!("{name} named differs from Python's:\n  rust   {}", full["named"]);
             }
             if got.get("error") != w.get("error") {
                 println!("{name} error: rust {:?} python {:?}", got.get("error"), w.get("error"));
@@ -59,7 +127,7 @@ fn golden_to_api_matches_python_on_every_workflow() {
             panic!("{name} differs");
         }
         n += 1;
-        println!("  {name}: {} nodes", got["prompt"].as_object().map(|p| p.len()).unwrap_or(0));
+        println!("  {name}: {} nodes", full["prompt"].as_object().map(|p| p.len()).unwrap_or(0));
     }
     assert!(n >= 15, "the real workflows were checked ({n})");
 }
@@ -96,10 +164,12 @@ fn golden_build_matches_python_for_every_generator() {
                 Ok(p) => Value::Object(p),
                 Err(e) => serde_json::json!({"error": format!("ValueError: {e}")}),
             };
+            let full = got.clone();
+            let got = seal_nodes(&got);
             if got != want[&key] {
                 for (k, v) in want[&key].as_object().unwrap() {
                     if got.get(k) != Some(v) {
-                        println!("{key} {k}:\n  rust   {}\n  python {v}", got.get(k).map(|x| x.to_string()).unwrap_or_default());
+                        println!("{key} {k} differs from Python's (fingerprint {v}):\n  rust   {}", full.get(k).map(|x| x.to_string()).unwrap_or("missing".into()));
                     }
                 }
                 for k in got.as_object().unwrap().keys() {
@@ -120,7 +190,7 @@ fn golden_generator_list_matches_python() {
     use cubic_gateway::media;
     let want = python("generators");
     let catalog = media::Catalog::new(media::Paths::from_env());
-    let got = Value::from(catalog.list(Some(&object_info())));
+    let got = seal_defaults(&Value::from(catalog.list(Some(&object_info()))));
     for (g, w) in got.as_array().unwrap().iter().zip(want.as_array().unwrap()) {
         assert_eq!(g, w, "{}", w["id"]);
     }

@@ -287,113 +287,52 @@ fn twelve_connections_per_address() {
     assert_eq!(ask(s.gw.port, &s.pin, "GET", "/v1/health", Some(&s.token), None).status, 200);
 }
 
-/// The Python gateway on a spare port, with the real identity but nothing shared with the live
-/// gateway: its own cache and ComfyUI folders, a ComfyUI port nobody listens on (so it can't
-/// clear the real queue), and a stand-in avahi so nothing is announced to the phone.
-struct PythonGateway {
-    child: std::process::Child,
-    port: u16,
-    dir: std::path::PathBuf,
-}
-
-impl PythonGateway {
-    fn start() -> PythonGateway {
-        let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cubicai/server");
-        let dir = std::env::temp_dir().join(format!("cubic-gw-python-{}", std::process::id()));
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(dir.join("comfy")).unwrap();
-        let avahi = bin.join("avahi-publish-service");
-        std::fs::write(&avahi, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&avahi, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-        let child = std::process::Command::new(server.join(".venv/bin/python"))
-            .arg(server.join("cubicai_server.py"))
-            .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
-            .env("PATH", path)
-            .env("CUBICAI_CACHE_DIR", dir.join("cache"))
-            .env("CUBICAI_COMFY_DIR", dir.join("comfy"))
-            .env("CUBICAI_COMFY_PORT", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("the CubicAI repo's Python gateway");
-        let g = PythonGateway { child, port, dir };
-        let t = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(t.elapsed().as_secs() < 20, "the Python gateway didn't start");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        g
-    }
-}
-
-impl Drop for PythonGateway {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// The Rust gateway beside the Python one (started here on a spare port), with the same identity
-/// and the real Ollama: the phone must see the same models and the same kind of stream. Run with
-/// `cargo test -p cubic-gateway --release real_matches_python -- --ignored --nocapture`.
+/// The Rust gateway on a spare port with the real identity and the real Ollama and SearXNG: what the
+/// phone sees, the stream a short chat makes, and a live search. (It once ran beside the Python
+/// gateway and matched it; the event shapes below are what both sent.) Run with
+/// `cargo test -p cubic-gateway --release real_ollama -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn real_matches_python() {
+fn real_ollama_chat_and_search() {
     // No media here: starting the media manager clears ComfyUI's cubicai folders and the temp
-    // folder, which the running Python gateway shares (its undelivered results live there).
+    // folder, which the running service shares (its undelivered results live there).
     let config = Config { media: None, ..Config::from_env() };
-    let id = identity::load(&config.dir).expect("the Python gateway's identity");
+    let id = identity::load(&config.dir).expect("this PC's gateway identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
-    let py = PythonGateway::start();
-    let (rust, python) = (gw.port, py.port);
-    let get = |port: u16| ask(port, &id.fingerprint, "GET", "/v1/models", Some(&id.token), None).json();
-    let (r, p) = (get(rust), get(python));
-    let pick = |v: &Value| -> Vec<Value> {
-        v["data"].as_array().unwrap().iter().map(|m| json!([m["id"], m["context_length"], m["input_modalities"], m["supported_parameters"], m["cubic_recommended"], m["size"]])).collect()
-    };
-    for m in pick(&r) {
-        println!("  {m}");
+    let rust = gw.port;
+    let r = ask(rust, &id.fingerprint, "GET", "/v1/models", Some(&id.token), None).json();
+    let models = r["data"].as_array().expect("a model list");
+    for m in models {
+        println!("  {}", json!([m["id"], m["context_length"], m["input_modalities"], m["supported_parameters"], m["cubic_recommended"], m["size"]]));
     }
-    assert_eq!(pick(&r), pick(&p), "the same models, contexts, abilities and recommendation");
+    assert!(!models.is_empty() && models.iter().all(|m| m["context_length"].as_u64().unwrap_or(0) > 0), "Ollama's models, each with its context");
+    assert_eq!(models.iter().filter(|m| m["cubic_recommended"] == true).count(), 1, "one recommended model");
     for k in ["cubic_remote", "cubic_lan6"] {
-        // Each test gateway has its own port; the addresses must match.
-        let r_url = r[k].as_str().map(|u| u.replace(&format!(":{rust}"), ":8443"));
-        let p_url = p[k].as_str().map(|u| u.replace(&format!(":{python}"), ":8443"));
-        assert_eq!(r_url, p_url, "{k}");
         println!("  {k}: {}", r[k]);
     }
 
-    // The same short chat through both: the same kinds of events in the same order.
-    let model = std::env::var("CHAT_MODEL").unwrap_or_else(|_| r["data"].as_array().unwrap().iter().find(|m| m["cubic_recommended"] == true).unwrap()["id"].as_str().unwrap().to_string());
+    // A short chat: content, then the final usage, then [DONE].
+    let model = std::env::var("CHAT_MODEL").unwrap_or_else(|_| models.iter().find(|m| m["cubic_recommended"] == true).unwrap()["id"].as_str().unwrap().to_string());
     let body = json!({"model": model, "messages": [{"role": "user", "content": "Reply with just the word: hello"}], "cubic_think": false}).to_string();
-    let shape = |port: u16| -> (Vec<String>, String) {
-        let t = Instant::now();
-        let resp = ask(port, &id.fingerprint, "POST", "/v1/chat/completions", Some(&id.token), Some(&body));
-        let ev = resp.events();
-        let text: String = ev.iter().filter_map(|e| serde_json::from_str::<Value>(e).ok()).filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(String::from)).collect();
-        let mut kinds: Vec<String> = ev
-            .iter()
-            .map(|e| match serde_json::from_str::<Value>(e) {
-                Ok(v) if v.get("cubic_status").is_some() => "status".into(),
-                Ok(v) if v.get("usage").is_some() => "usage".into(),
-                Ok(v) if v.get("error").is_some() => format!("error {}", v["error"]["message"]),
-                Ok(v) => v["choices"][0]["delta"].as_object().map(|d| d.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default(),
-                Err(_) => e.clone(),
-            })
-            .collect();
-        kinds.dedup();
-        println!("  port {port}: {:?} in {:.1} s: {text:?}", kinds, t.elapsed().as_secs_f32());
-        (kinds, text)
-    };
-    let (pk, pt) = shape(python);
-    let (rk, rt) = shape(rust);
-    let strip = |k: &[String]| k.iter().filter(|x| *x != "status").cloned().collect::<Vec<_>>();
-    assert_eq!(strip(&rk), strip(&pk), "the same events (a loading status only shows when the model wasn't in memory)");
-    assert!(rt.to_lowercase().contains("hello") && pt.to_lowercase().contains("hello"));
+    let t = Instant::now();
+    let ev = ask(rust, &id.fingerprint, "POST", "/v1/chat/completions", Some(&id.token), Some(&body)).events();
+    let text: String = ev.iter().filter_map(|e| serde_json::from_str::<Value>(e).ok()).filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(String::from)).collect();
+    let mut kinds: Vec<String> = ev
+        .iter()
+        .map(|e| match serde_json::from_str::<Value>(e) {
+            Ok(v) if v.get("cubic_status").is_some() => "status".into(),
+            Ok(v) if v.get("usage").is_some() => "usage".into(),
+            Ok(v) if v.get("error").is_some() => format!("error {}", v["error"]["message"]),
+            Ok(v) => v["choices"][0]["delta"].as_object().map(|d| d.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default(),
+            Err(_) => e.clone(),
+        })
+        .filter(|k| k != "status") // a loading status only shows when the model wasn't in memory
+        .collect();
+    kinds.dedup();
+    println!("  {kinds:?} in {:.1} s: {text:?}", t.elapsed().as_secs_f32());
+    assert_eq!(kinds.last().map(String::as_str), Some("[DONE]"));
+    assert!(kinds.iter().any(|k| k.contains("content")) && kinds.contains(&"usage".to_string()), "{kinds:?}");
+    assert!(text.to_lowercase().contains("hello"));
 
     // Web search through the real SearXNG and real pages.
     let body = json!({"model": model, "cubic_web_search": true, "cubic_think": false, "messages": [{"role": "user", "content": "What is the latest stable Rust version? One sentence."}]}).to_string();

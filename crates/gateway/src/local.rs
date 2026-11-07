@@ -13,8 +13,7 @@ use std::time::Duration;
 
 pub const SERVICE: &str = "cubicai-server";
 
-/// The systemd unit: the same name and sandbox as the Python gateway's, so switching back is
-/// putting that unit back.
+/// The systemd unit: the same name and sandbox the Python gateway had.
 pub const UNIT: &str = r#"[Unit]
 Description=CubicAI private gateway (phone app -> Ollama)
 After=network-online.target
@@ -36,6 +35,19 @@ UMask=0077
 
 [Install]
 WantedBy=default.target
+"#;
+
+/// ComfyUI as its own unit, which the gateway starts when a job needs it and stops when idle
+/// (`jobs::Comfy`). Only reachable from this PC; no metadata in files, so prompts don't travel
+/// inside the pictures; only warnings and errors reach the journal.
+pub const COMFY_UNIT: &str = r#"[Unit]
+Description=ComfyUI for CubicAI (started on demand by cubicai-server, stopped when idle)
+
+[Service]
+# Only reachable from this PC; the phone goes through cubicai-server. No metadata in files, so prompts
+# don't travel inside the images, and only warnings and errors reach the journal.
+ExecStart=/mnt/storage/games/AI_local/tools/start-comfyui.sh --listen 127.0.0.1 --port 8188 --preview-method auto --disable-metadata --disable-auto-launch --verbose WARNING
+TimeoutStopSec=20
 "#;
 
 /// Accepts exactly one certificate, by its SHA-256 fingerprint.
@@ -102,6 +114,10 @@ pub fn unit_path() -> PathBuf {
     home().join(".config/systemd/user/cubicai-server.service")
 }
 
+pub fn comfy_unit_path() -> PathBuf {
+    home().join(".config/systemd/user/cubicai-comfyui.service")
+}
+
 pub fn installed_binary() -> PathBuf {
     home().join(".local/bin/cubicai-gateway")
 }
@@ -120,7 +136,8 @@ pub fn service_kind(unit: &Path) -> Option<&'static str> {
 }
 
 /// Copies `binary` to ~/.local/bin (a rename, so a running gateway keeps its own file), writes
-/// the unit and (re)starts the service.
+/// the unit (and ComfyUI's, unless one is there already: it may point at another ComfyUI) and
+/// (re)starts the service.
 pub fn install(binary: &Path) -> Result<(), String> {
     let target = installed_binary();
     std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -132,6 +149,9 @@ pub fn install(binary: &Path) -> Result<(), String> {
     let unit = unit_path();
     std::fs::create_dir_all(unit.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&unit, UNIT).map_err(|e| e.to_string())?;
+    if !comfy_unit_path().exists() {
+        std::fs::write(comfy_unit_path(), COMFY_UNIT).map_err(|e| e.to_string())?;
+    }
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", SERVICE])?;
     systemctl(&["restart", SERVICE])?;
@@ -165,6 +185,16 @@ mod tests {
             assert!(UNIT.lines().any(|l| l == line), "{line}");
         }
         assert_eq!(UNIT.lines().filter(|l| l.starts_with("ReadWritePaths=")).count(), 2);
+    }
+
+    #[test]
+    fn comfyui_stays_private_and_keeps_no_prompts() {
+        let exec = COMFY_UNIT.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        for flag in ["--listen 127.0.0.1", "--port 8188", "--disable-metadata", "--disable-auto-launch"] {
+            assert!(exec.contains(flag), "{flag}");
+        }
+        // The gateway knows it by this name.
+        assert!(comfy_unit_path().ends_with("cubicai-comfyui.service"));
     }
 
     #[test]

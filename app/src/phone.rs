@@ -17,11 +17,6 @@ pub const SEARX_CONTAINER: &str = "cubicai-searxng";
 pub const CONTEXTS: [(u64, &str); 4] = [(8192, "8K"), (16384, "16K"), (32768, "32K"), (65536, "64K")];
 pub const DEFAULT_CTX: u64 = 16384;
 
-/// The Python gateway's unit in the CubicAI repo next to this one, for switching back.
-pub fn python_unit() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cubicai/server/cubicai-server.service")
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Loaded {
     pub name: String,
@@ -311,14 +306,6 @@ pub fn use_rust() -> Result<String, String> {
     let bin = gateway_binary().ok_or("Build the gateway first: cargo build --release -p cubic-gateway")?;
     local::install(&bin)?;
     Ok("The service runs the Rust gateway now".into())
-}
-
-pub fn use_python() -> Result<String, String> {
-    let unit = std::fs::read_to_string(python_unit()).map_err(|e| format!("the Python gateway's unit: {e}"))?;
-    std::fs::write(local::unit_path(), unit).map_err(|e| e.to_string())?;
-    local::systemctl(&["daemon-reload"])?;
-    local::systemctl(&["restart", local::SERVICE])?;
-    Ok("The service runs the Python gateway again".into())
 }
 
 pub fn unpair(dir: &std::path::Path) -> Result<String, String> {
