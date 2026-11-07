@@ -62,10 +62,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         hf_view(app, ui, &p);
         return;
     }
+    // The list never takes more than about 40 % of a narrow window, so the cards beside it keep room.
+    let total = ui.available_width();
+    let list_max = (total * 0.42).clamp(260.0, 560.0);
     egui::Panel::left("library")
         .resizable(true)
-        .default_size(380.0)
-        .size_range(300.0..=560.0)
+        .default_size(380.0f32.min(list_max))
+        .size_range(260.0f32.min(list_max)..=list_max)
         .frame(egui::Frame::new().fill(p.low).inner_margin(egui::Margin::same(14)))
         .show(ui, |ui| library(app, ui, &p));
     egui::CentralPanel::no_frame().show(ui, |ui| {
@@ -127,8 +130,9 @@ fn library(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
                 egui::Margin::symmetric(10, 7),
                 |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(short_model_name(&m.name)).strong());
+                    // Long names wrap rather than widening the list past its share of the window.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(egui::Label::new(RichText::new(short_model_name(&m.name)).strong()).wrap());
                         if running {
                             widgets::badge(ui, "running", p.on_primary, p.good);
                         }
@@ -309,7 +313,7 @@ fn llama_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 fn hardware_card(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     let g = app.gpu.info.clone();
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             widgets::card_title(ui, "Hardware");
             ui.label(RichText::new(&g.name).color(p.on_variant));
         });

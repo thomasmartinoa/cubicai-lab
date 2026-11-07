@@ -6,7 +6,12 @@ use egui_kittest::Harness;
 use std::time::{Duration, Instant};
 
 fn harness(theme: egui::Theme) -> Harness<'static, App> {
-    Harness::builder().with_size(egui::vec2(1380.0, 880.0)).with_theme(theme).with_accessibility_check(false).wgpu().build_eframe(|cc| App::new(cc))
+    // SIZE=1000x760 checks a narrow window (tiled beside a terminal).
+    let size = std::env::var("SIZE").ok().and_then(|s| {
+        let (w, h) = s.split_once('x')?;
+        Some(egui::vec2(w.parse().ok()?, h.parse().ok()?))
+    });
+    Harness::builder().with_size(size.unwrap_or(egui::vec2(1380.0, 880.0))).with_theme(theme).with_accessibility_check(false).wgpu().build_eframe(|cc| App::new(cc))
 }
 
 fn settle(h: &mut Harness<'_, App>, ms: u64, until: impl Fn(&mut App) -> bool) {

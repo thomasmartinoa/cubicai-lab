@@ -306,3 +306,21 @@ pub fn fmt_duration_ms(ms: u64) -> String {
         format!("{}m {:02}s", ms / 60_000, (ms / 1000) % 60)
     }
 }
+
+/// A page's one column: at most `max` wide (margins included) and centred, so a wide window doesn't
+/// leave all its spare room on the right.
+pub fn centred<R>(ui: &mut Ui, max: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let avail = ui.available_width();
+    let w = avail.min(max);
+    let pad = ((avail - w) / 2.0).floor().max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(pad);
+        ui.vertical(|ui| {
+            ui.set_width(w);
+            add(ui)
+        })
+        .inner
+    })
+    .inner
+}

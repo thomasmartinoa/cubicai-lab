@@ -5,10 +5,10 @@ Rust workspace (edition 2024): `crates/gguf` (cubic-gguf, no UI), `crates/gatewa
 ## Build / check
 - `cargo build --release`; `cargo clippy --workspace --all-targets` should stay clean.
 - Screens are checked offscreen with egui_kittest (`app/src/shots.rs`):
-  - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] cargo test --release shots -- --nocapture`
+  - `SHOTS=<dir> MODEL=<name part> TENSOR=<tensor> [LIGHT=1] [SIZE=960x760] cargo test --release shots -- --nocapture` (SIZE checks a narrow window: the top bar drops the server words, then the brand words, then scrolls its tabs; side panels shrink with the window; Phone and Settings are a centred column)
   - Read the PNGs rather than opening windows on the desktop.
 - Tests:
-  - `cargo test --workspace --release` runs about 156 offline tests in roughly a second, and must stay green.
+  - `cargo test --workspace --release` runs about 157 offline tests in roughly a second, and must stay green.
   - Test helpers live in `app/src/tests/mod.rs`: `tiny_model` (a GGUF built with `cubic_gguf::Writer`), `TempDir` and `mock_http`.
   - Decoder fixtures come from gguf-py (`crates/gguf/tests/fixtures/make.py`).
   - Live tests are `#[ignore]`: `net_*` (network/Ollama), and `net_real_llama` / `net_real_train`. The last two run downloaded llama.cpp, Python and Unsloth; the user has allowed me to run them. `net_real_train` (Llama 3.1 8B, RTX 3070 Ti 8 GB): 18 steps in 44 s, loss 3.72 -> 0.13, base "The capital of Japan is Tokyo." vs tuned "Ahoy! Tokyo is the capital of Japan.". The Fine-tune shots replay that run (`AHOY_FACTS`, `REAL_LOSSES` in shots.rs).

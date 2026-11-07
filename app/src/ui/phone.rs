@@ -16,9 +16,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ctx.request_repaint_after(std::time::Duration::from_secs(2));
     let status = app.phone.status();
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
-            let wide = app.phone.view == View::Pair && ui.available_width() >= 1000.0;
-            ui.set_max_width(ui.available_width().min(if wide { 1120.0 } else { 760.0 }));
+        let wide = app.phone.view == View::Pair && ui.available_width() >= 1032.0;
+        widgets::centred(ui, if wide { 1152.0 } else { 792.0 }, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
             widgets::segmented(ui, &mut app.phone.view, &[(View::Status, "Status"), (View::Pair, "Pair a phone"), (View::Activity, "Activity")]);
             ui.add_space(12.0);
             let Some(s) = status else {
@@ -42,6 +42,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
                 View::Activity => activity_view(ui, &s),
             }
+            });
         });
     });
     confirm_unpair(app, &ctx);

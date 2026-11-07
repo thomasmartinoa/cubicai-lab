@@ -124,6 +124,8 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     let p = *pal(ui.ctx());
     let ctx = ui.ctx().clone();
     ui.horizontal(|ui| {
+        // The model list gives up width first when the window is narrow (provider 130, behaviour 150, meter ~140).
+        let model_w = (ui.available_width() - 130.0 - 150.0 - 140.0 - 4.0 * ui.spacing().item_spacing.x).clamp(140.0, 300.0);
         // Provider.
         let cur = providers::get(&app.settings.provider);
         egui::ComboBox::from_id_salt("provider").selected_text(cur.short).width(130.0).show_ui(ui, |ui| {
@@ -134,7 +136,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
         });
-        model_picker(app, ui, &ctx);
+        model_picker(app, ui, &ctx, model_w);
         // Behaviour.
         let persona = app.settings.persona.clone();
         let label = app.persona_name(&persona).unwrap_or_else(|| "No behaviour".into());
@@ -166,12 +168,12 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn model_picker(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+fn model_picker(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, width: f32) {
     let pid = app.settings.provider.clone();
     if pid == providers::PC {
         let key = app.settings.models.get(&pid).cloned().unwrap_or_default();
         let label = app.library.get(&key).map(|m| short_model_name(&m.name)).unwrap_or_else(|| "Pick a model".into());
-        egui::ComboBox::from_id_salt("pc-model").selected_text(label).width(300.0).height(520.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("pc-model").selected_text(label).width(width).height(520.0).show_ui(ui, |ui| {
             if app.library.models.is_empty() {
                 ui.label("No models yet: add some in the Engine Room.");
             }
@@ -198,7 +200,7 @@ fn model_picker(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
     let current = app.settings.models.get(&pid).cloned().unwrap_or_else(|| providers::get(&pid).suggested.first().map(|s| s.to_string()).unwrap_or_default());
     let mut chosen = current.clone();
-    egui::ComboBox::from_id_salt(("model", &pid)).selected_text(if chosen.is_empty() { "Model".into() } else { chosen.clone() }).width(300.0).height(520.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("model", &pid)).selected_text(if chosen.is_empty() { "Model".into() } else { chosen.clone() }).width(width).height(520.0).show_ui(ui, |ui| {
         ui.add(egui::TextEdit::singleline(&mut chosen).hint_text("model id"));
         ui.separator();
         match &lists {

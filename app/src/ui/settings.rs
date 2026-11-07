@@ -27,8 +27,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.settings_ui.loaded = true;
     }
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
-            ui.set_max_width(ui.available_width().min(760.0));
+        widgets::centred(ui, 792.0, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
             let mut dirty = false;
 
             widgets::card(ui, |ui| {
@@ -222,6 +222,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             if dirty {
                 app.save_settings();
             }
+            });
         });
     });
 }

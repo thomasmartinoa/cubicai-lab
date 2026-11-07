@@ -195,9 +195,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.xray.run_when_ready = false;
     }
 
+    // Side columns narrow with the window so the reply in the middle keeps room to read.
+    let total = ui.available_width();
+    let left_w = (total * 0.28).clamp(300.0, 310.0);
+    let right_w = (total * 0.27).clamp(250.0, 360.0);
     egui::Panel::left("xray-left")
         .resizable(false)
-        .exact_size(310.0)
+        .exact_size(left_w)
         .frame(egui::Frame::new().fill(p.lowest).inner_margin(16))
         .show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| controls(app, ui, &p));
@@ -205,7 +209,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let selected_step = app.xray.selected;
     egui::Panel::right("xray-right")
         .resizable(false)
-        .exact_size(360.0)
+        .exact_size(right_w)
         .frame(egui::Frame::new().fill(p.lowest).inner_margin(16))
         .show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -341,6 +345,8 @@ fn reply(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
 
     // Header: branch, state, colour mode.
     let mut colour = app.xray.colour;
+    // Narrow: the colour switch and Copy go on their own row under the title instead of on top of it.
+    let one_row = ui.available_width() >= 520.0;
     ui.horizontal(|ui| {
         let title = if b == 0 { "Main reply".to_string() } else { format!("Fork {b}") };
         ui.label(RichText::new(title).font(theme::heading(18.0)));
@@ -350,13 +356,23 @@ fn reply(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
             BranchState::Stopped => widgets::hint(ui, "stopped"),
             BranchState::Failed(_) => ui.label(RichText::new("failed").small().color(p.error)),
         };
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if one_row {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                widgets::segmented(ui, &mut colour, &[(Colour::Confidence, "Confidence"), (Colour::Uncertainty, "Uncertainty")]);
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(tree.text(b));
+                }
+            });
+        }
+    });
+    if !one_row {
+        ui.horizontal(|ui| {
             widgets::segmented(ui, &mut colour, &[(Colour::Confidence, "Confidence"), (Colour::Uncertainty, "Uncertainty")]);
             if ui.small_button("Copy").clicked() {
                 ui.ctx().copy_text(tree.text(b));
             }
         });
-    });
+    }
     app.xray.colour = colour;
     if let BranchState::Failed(e) = &br.state {
         ui.label(RichText::new(e).color(p.error));
@@ -364,7 +380,8 @@ fn reply(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
     ui.add_space(4.0);
     timeline(ui, p, &path, offset, colour, &mut app.xray.selected);
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    // Wraps, so a narrow window keeps the reply as wide as the column instead of clipping it.
+    ui.horizontal_wrapped(|ui| {
         let (lo, hi, l1, l2) = match colour {
             Colour::Confidence => (p.low, HOT, "sure", "unsure"),
             Colour::Uncertainty => (p.low, COOL, "one clear choice", "many close rivals"),
@@ -376,7 +393,8 @@ fn reply(app: &mut App, ui: &mut egui::Ui, p: &Palette) {
             ui.painter().rect_filled(Rect::from_min_size(egui::pos2(x0, r.top()), vec2(r.width() / 24.0 + 0.5, r.height())), 0.0, widgets::lerp_color(lo, hi, i as f32 / 23.0));
         }
         widgets::hint(ui, l2);
-        widgets::hint(ui, "  ·  underlined: forked here  ·  outlined: the alternative this fork took");
+        widgets::hint(ui, "underlined: forked here");
+        widgets::hint(ui, "outlined: the alternative this fork took");
     });
     ui.add_space(8.0);
 
