@@ -315,7 +315,7 @@ fn a_whole_call() {
     let dir = std::env::temp_dir().join(format!("cubic-gw-voice-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let fake = Arc::new(Fake { spoken: AtomicUsize::new(0) });
-    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(voice::Voice::given(fake.clone())) };
+    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(voice::Voice::given(fake.clone())), bots: None };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let (port, pin, token) = (gw.port, id.fingerprint.clone(), id.token.clone());
@@ -415,7 +415,7 @@ fn not_set_up() {
     std::fs::create_dir_all(&paths.dir).unwrap();
     std::fs::write(&paths.ort_lib, b"").unwrap();
     assert_eq!(paths.missing().as_deref(), Some("the voice models (run: cubicai-gateway voice-setup)"));
-    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(voice::Voice::new(paths)) };
+    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(voice::Voice::new(paths)), bots: None };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let v = ask(gw.port, &id.fingerprint, "GET", "/v1/voice/voices", Some(&id.token), None).json();
@@ -437,7 +437,7 @@ fn real_call_with_the_real_models() {
     let _ = std::fs::remove_dir_all(&dir);
     let v = voice::Voice::new(voice::Paths::from_env());
     let line = "Hey, can you tell me what the weather looks like for a walk this afternoon?";
-    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(v.clone()) };
+    let config = Config { dir: dir.clone(), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: None, voice: Some(v.clone()), bots: None };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let mut c = connect(gw.port, &id.fingerprint);

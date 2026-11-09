@@ -222,7 +222,7 @@ fn setup() -> Setup {
         // A unit that doesn't exist: nothing on this PC is started or stopped by the test.
         unit: "cubicai-test-does-not-exist.service".into(),
     };
-    let config = Config { dir: root.join("config"), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: Some(paths), voice: None };
+    let config = Config { dir: root.join("config"), ollama: "http://127.0.0.1:1".into(), searxng: "http://127.0.0.1:1".into(), default_ctx: 16384, media: Some(paths), voice: None, bots: None };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, comfy, root }
@@ -430,7 +430,7 @@ fn real_comfy_makes_a_picture() {
         }
     }
     let _off = Off((!was_on).then(|| unit.clone()));
-    let config = Config { media: Some(paths), ..Config::from_env() };
+    let config = Config { media: Some(paths), bots: None, ..Config::from_env() };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let (port, pin, token) = (gw.port, id.fingerprint.clone(), id.token.clone());

@@ -31,6 +31,8 @@ ProtectHome=read-only
 ReadWritePaths=%h/.config/cubicai-server -%h/.cache/cubicai-server
 # Media: the gateway places inputs for ComfyUI, collects its results, and stores what the phone saves.
 ReadWritePaths=-/mnt/storage/games/AI_local/ComfyUI/input/cubicai -/mnt/storage/games/AI_local/ComfyUI/output/cubicai -/mnt/storage/games/AI_local/CubicAI
+# Bots: their chats and memory, and the workspace folder they share (install makes both).
+ReadWritePaths=-%h/.local/share/cubicai-server/bots -%h/.local/share/cubicai-server/workspace
 UMask=0077
 
 [Install]
@@ -146,6 +148,12 @@ pub fn install(binary: &Path) -> Result<(), String> {
         std::fs::copy(binary, &tmp).map_err(|e| format!("copying the gateway: {e}"))?;
         std::fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
     }
+    // The service can't make folders in the (read-only) home itself, so the Bots' folders are made here.
+    let share = home().join(".local/share/cubicai-server");
+    for d in ["bots", "workspace"] {
+        std::fs::create_dir_all(share.join(d)).map_err(|e| format!("making {d}: {e}"))?;
+        let _ = std::fs::set_permissions(share.join(d), std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    }
     let unit = unit_path();
     std::fs::create_dir_all(unit.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&unit, UNIT).map_err(|e| e.to_string())?;
@@ -179,12 +187,13 @@ mod tests {
 
     #[test]
     fn the_unit_keeps_the_python_sandbox() {
-        // Everything the Python unit allowed, and nothing more: home stays read-only (the voice
-        // models and ONNX Runtime are only read), writes go to our own folders.
+        // Everything the Python unit allowed, plus the Bots' two folders: home stays read-only (the
+        // voice models and ONNX Runtime are only read), writes go to our own folders.
         for line in ["ProtectHome=read-only", "ProtectSystem=strict", "NoNewPrivileges=yes", "PrivateTmp=yes", "UMask=0077", "ReadWritePaths=%h/.config/cubicai-server -%h/.cache/cubicai-server"] {
             assert!(UNIT.lines().any(|l| l == line), "{line}");
         }
-        assert_eq!(UNIT.lines().filter(|l| l.starts_with("ReadWritePaths=")).count(), 2);
+        assert!(UNIT.lines().any(|l| l == "ReadWritePaths=-%h/.local/share/cubicai-server/bots -%h/.local/share/cubicai-server/workspace"));
+        assert_eq!(UNIT.lines().filter(|l| l.starts_with("ReadWritePaths=")).count(), 3);
     }
 
     #[test]

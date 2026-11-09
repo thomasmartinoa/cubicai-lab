@@ -112,7 +112,7 @@ fn setup(name: &str) -> Setup {
     let dir = std::env::temp_dir().join(format!("cubic-gw-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (backend, seen) = fake_backend();
-    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384, media: None, voice: None };
+    let config = Config { dir: dir.clone(), ollama: backend.clone(), searxng: backend, default_ctx: 16384, media: None, voice: None, bots: None };
     let id = identity::load(&dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, seen, dir }
@@ -296,7 +296,7 @@ fn twelve_connections_per_address() {
 fn real_ollama_chat_and_search() {
     // No media here: starting the media manager clears ComfyUI's cubicai folders and the temp
     // folder, which the running service shares (its undelivered results live there).
-    let config = Config { media: None, ..Config::from_env() };
+    let config = Config { media: None, bots: None, ..Config::from_env() };
     let id = identity::load(&config.dir).expect("this PC's gateway identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     let rust = gw.port;

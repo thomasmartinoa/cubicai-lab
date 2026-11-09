@@ -27,14 +27,17 @@ pub struct Gateway {
     pub ollama: Ollama,
     pub host: Host,
     pub media: Option<Arc<crate::jobs::Jobs>>,
+    pub bots: Option<Arc<crate::bots::Bots>>,
     vram: OnceLock<Option<u64>>,
     slots: Mutex<(usize, HashMap<IpAddr, usize>)>,
 }
 
 impl Gateway {
     pub fn new(config: Config, id: &Identity, port: u16) -> Gateway {
+        let media = config.media.clone().map(|p| crate::jobs::Jobs::new(p, &config.ollama));
         Gateway {
-            media: config.media.clone().map(|p| crate::jobs::Jobs::new(p, &config.ollama)),
+            bots: config.bots.clone().map(|p| crate::bots::Bots::new(p, &config.dir, &config.ollama, &config.searxng, config.default_ctx, media.clone())),
+            media,
             settings: Settings::new(&config.dir),
             ollama: Ollama::new(&config.ollama),
             config,
@@ -253,6 +256,9 @@ pub fn handle<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req:
         return conn.json(req, 401, &error("Not paired: invalid token"));
     }
     let path = req.path().to_string();
+    if crate::bots::api::handles(&path) {
+        return crate::bots::api::route(gw, conn, req, &path);
+    }
     match req.method.as_str() {
         "GET" => match path.as_str() {
             "/health" | "/v1/health" => conn.json(req, 200, &json!({"ok": true})),

@@ -6,10 +6,12 @@
 //!   access is on, Tailscale may connect. Everyone else is dropped before the TLS handshake.
 //! - Every request needs the pairing token; TLS 1.3 with a self-signed certificate the app pins.
 //! - Web search runs here (a local SearXNG), so the phone never talks to search engines.
-//! - Message content is never logged or stored.
+//! - Message content is never logged. Chats are only stored for Bots (their own chat and memory, in
+//!   the owner-only data folder), since keeping them is what a Bot is for.
 
 pub mod access;
 pub mod activity;
+pub mod bots;
 pub mod chat;
 pub mod http;
 pub mod identity;
@@ -48,6 +50,8 @@ pub struct Config {
     pub media: Option<media::Paths>,
     /// Voice calls (None: the phone is told they aren't set up).
     pub voice: Option<std::sync::Arc<voice::Voice>>,
+    /// Bots' folders (None: no Bots on this gateway).
+    pub bots: Option<bots::Paths>,
 }
 
 /// Where the identity and settings.json live (`CUBICAI_CONFIG_DIR`, else ~/.config/cubicai-server).
@@ -66,6 +70,7 @@ impl Config {
             default_ctx: std::env::var("CUBICAI_NUM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(16384),
             media: Some(media::Paths::from_env()),
             voice: Some(voice::Voice::new(voice::Paths::from_env())),
+            bots: Some(bots::Paths::from_env()),
         }
     }
 }

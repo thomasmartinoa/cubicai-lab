@@ -60,3 +60,17 @@ pub fn stamp() -> String {
     let t = now_local();
     format!("{} {:02}:{:02}:{:02}", t.date(), t.hour, t.minute, t.second)
 }
+
+/// Seconds since the epoch for a local date and time (libc's mktime: daylight saving is worked
+/// out, and a day or minute past the end of the month or hour rolls over).
+pub fn local_epoch(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+    // SAFETY: mktime only reads and normalises the tm we hand it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month as i32 - 1;
+    tm.tm_mday = day as i32;
+    tm.tm_hour = hour as i32;
+    tm.tm_min = minute as i32;
+    tm.tm_isdst = -1;
+    unsafe { libc::mktime(&mut tm) as i64 }
+}
