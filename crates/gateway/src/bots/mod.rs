@@ -11,6 +11,8 @@
 
 pub mod api;
 pub mod brain;
+pub mod computer;
+pub mod proxy;
 pub mod routines;
 pub mod tools;
 
@@ -37,6 +39,10 @@ pub const MEMORY_CHARS: usize = 6000;
 pub const LATE_LIMIT_SECS: i64 = 6 * 3600;
 /// Routines a Bot may propose that the user hasn't answered yet.
 pub const MAX_PENDING: usize = 3;
+/// How long a run waits for the user to allow an action before giving up on it.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(15 * 60);
+/// Screenshots kept per Bot (older ones go).
+pub const SHOTS_KEPT: usize = 200;
 /// Feed items kept for the phone's notifications.
 pub const FEED_ITEMS: usize = 200;
 pub const PROVIDERS: [&str; 5] = ["local", "xai", "gemini", "openrouter", "custom"];
@@ -47,6 +53,8 @@ pub const PROVIDERS: [&str; 5] = ["local", "xai", "gemini", "openrouter", "custo
 pub struct Paths {
     pub bots: PathBuf,
     pub workspace: PathBuf,
+    /// The Bots' computer (None: Bots have no computer, as in most tests).
+    pub computer: Option<computer::Setup>,
 }
 
 impl Paths {
@@ -56,6 +64,7 @@ impl Paths {
         Paths {
             bots: std::env::var_os("CUBICAI_BOTS_DIR").map(PathBuf::from).unwrap_or_else(|| share.join("bots")),
             workspace: std::env::var_os("CUBICAI_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| share.join("workspace")),
+            computer: Some(computer::Setup::from_env(&home)),
         }
     }
 }
@@ -71,12 +80,14 @@ pub struct Bot {
     /// One of [`PROVIDERS`].
     pub provider: String,
     pub model: String,
+    /// Whether it may use the computer (terminal and browser), when there is one.
+    pub computer: bool,
     pub created: f64,
 }
 
 impl Bot {
     pub fn to_json(&self) -> Value {
-        json!({"id": self.id, "name": self.name, "job": self.job, "color": self.color, "provider": self.provider, "model": self.model, "created": self.created})
+        json!({"id": self.id, "name": self.name, "job": self.job, "color": self.color, "provider": self.provider, "model": self.model, "computer": self.computer, "created": self.created})
     }
 
     pub fn from_json(v: &Value) -> Option<Bot> {
@@ -87,6 +98,7 @@ impl Bot {
             color: v["color"].as_str().unwrap_or("#2f6bff").to_string(),
             provider: v["provider"].as_str().unwrap_or("local").to_string(),
             model: v["model"].as_str().unwrap_or("").to_string(),
+            computer: v["computer"].as_bool().unwrap_or(true),
             created: v["created"].as_f64().unwrap_or(0.0),
         })
     }
@@ -108,6 +120,9 @@ impl Bot {
         }
         if let Some(m) = text("model") {
             self.model = m;
+        }
+        if let Some(c) = v["computer"].as_bool() {
+            self.computer = c;
         }
         self.check()
     }
@@ -217,6 +232,11 @@ pub struct Run {
     inbox: Mutex<Vec<Value>>,
     /// The routine that started it ({id, name}), for the feed.
     pub routine: Mutex<Option<Value>>,
+    /// An action waiting for the user's yes: {id, text, answer?}.
+    pub approval: Mutex<Option<Value>>,
+    /// What the user said no to in this turn: the turn then ends with a plain reply saying so.
+    denied: Mutex<Option<String>>,
+    answered: Condvar,
 }
 
 impl Run {
@@ -272,6 +292,7 @@ pub struct Bots {
     /// routines.json is changed by the phone, the Bots' tools and the scheduler.
     routines_lock: Mutex<()>,
     feed_lock: Mutex<()>,
+    pub computer: Option<computer::Computer>,
 }
 
 pub fn now_ms() -> u64 {
@@ -292,6 +313,7 @@ impl Bots {
     pub fn new(paths: Paths, config_dir: &Path, ollama: &str, searxng: &str, default_ctx: u64, media: Option<Arc<crate::jobs::Jobs>>) -> Arc<Bots> {
         let _ = std::fs::create_dir_all(&paths.bots);
         let _ = std::fs::create_dir_all(&paths.workspace);
+        let computer = paths.computer.as_ref().map(|c| computer::Computer::new(c, &paths.workspace));
         let bots = Arc::new(Bots {
             keys: Keys::new(config_dir),
             settings: Settings::new(config_dir),
@@ -304,13 +326,19 @@ impl Bots {
             files: Mutex::new(()),
             routines_lock: Mutex::new(()),
             feed_lock: Mutex::new(()),
+            computer,
         });
         // The scheduler: checks the routines every 15 s while the gateway (this Bots) is alive.
         let weak: Weak<Bots> = Arc::downgrade(&bots);
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(15));
             match weak.upgrade() {
-                Some(b) => b.tick(crate::time::now() as i64),
+                Some(b) => {
+                    b.tick(crate::time::now() as i64);
+                    if let Some(c) = &b.computer {
+                        c.idle_check();
+                    }
+                }
                 None => return,
             }
         });
@@ -342,7 +370,7 @@ impl Bots {
         if self.list().len() >= MAX_BOTS {
             return Err(format!("You have {MAX_BOTS} Bots already; delete one first."));
         }
-        let mut bot = Bot { id: new_id(), name: String::new(), job: String::new(), color: "#2f6bff".into(), provider: "local".into(), model: String::new(), created: crate::time::now() };
+        let mut bot = Bot { id: new_id(), name: String::new(), job: String::new(), color: "#2f6bff".into(), provider: "local".into(), model: String::new(), computer: true, created: crate::time::now() };
         bot.apply(v)?;
         self.save(&bot)?;
         if let Some(m) = v["memory"].as_str() {
@@ -401,6 +429,7 @@ impl Bots {
         if let Some(d) = self.dir(id) {
             let _g = self.files.lock().unwrap();
             let _ = std::fs::remove_file(d.join("chat.jsonl"));
+            let _ = std::fs::remove_dir_all(d.join("shots"));
         }
     }
 
@@ -416,6 +445,8 @@ impl Bots {
         match self.run(id) {
             Some(r) if !r.done.load(Ordering::SeqCst) => {
                 r.stop.store(true, Ordering::SeqCst);
+                let _g = r.approval.lock().unwrap();
+                r.answered.notify_all();
                 true
             }
             _ => false,
@@ -598,6 +629,153 @@ impl Bots {
         }
     }
 
+    /// Whether this Bot gets the computer's tools now.
+    fn has_computer(&self, bot: &Bot) -> bool {
+        bot.computer && self.computer.as_ref().is_some_and(|c| c.available())
+    }
+
+    /// The user's answer to an action waiting in the Bot's run. False when nothing with that id waits.
+    pub fn answer(&self, id: &str, approval: &str, allow: bool) -> bool {
+        let Some(run) = self.run(id) else { return false };
+        let mut a = run.approval.lock().unwrap();
+        match a.as_mut() {
+            Some(v) if v["id"] == approval && v["answer"].is_null() => {
+                v["answer"] = allow.into();
+                run.answered.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Asks the user (on the phone, with a notification) and waits: Some(answer), or None when the run
+    /// was stopped or nobody answered within APPROVAL_WAIT.
+    fn ask(&self, bot: &Bot, run: &Run, what: &str) -> Option<bool> {
+        let id = new_id();
+        *run.approval.lock().unwrap() = Some(json!({"id": id, "text": what}));
+        run.push(json!({"type": "approval", "id": id, "text": what}));
+        let mut first = what.chars();
+        let lower: String = first.next().map(|c| c.to_lowercase().chain(first).collect()).unwrap_or_default();
+        self.push_feed(bot, "approval", &format!("wants to {lower}. Allow it in the Bot's chat."), None, false);
+        let end = std::time::Instant::now() + APPROVAL_WAIT;
+        let mut a = run.approval.lock().unwrap();
+        let answer = loop {
+            if let Some(v) = a.as_ref().and_then(|v| v["answer"].as_bool()) {
+                break Some(v);
+            }
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            if run.stop.load(Ordering::SeqCst) || left.is_zero() {
+                break None;
+            }
+            a = run.answered.wait_timeout(a, left.min(Duration::from_secs(5))).unwrap().0;
+        };
+        *a = None;
+        drop(a);
+        run.push(json!({"type": "approved", "id": id, "allow": answer}));
+        answer
+    }
+
+    /// The computer's tools: a command in its terminal, or its browser. A page's screenshot is kept as
+    /// bots/<id>/shots/<tool message id>.jpg for the phone.
+    fn computer_tool(&self, bot: &Bot, run: &Run, name: &str, args: &str, tmsg_id: &str) -> (tools::Outcome, bool) {
+        let a: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+        let out = |text: String, ok: bool| (tools::Outcome { text, citations: vec![], ok }, false);
+        let Some(computer) = self.computer.as_ref().filter(|_| bot.computer) else {
+            return out("You don't have a computer (the user switched it off, or it isn't set up on this PC).".into(), false);
+        };
+        if name == "run_command" {
+            let command = a["command"].as_str().unwrap_or("").trim();
+            if command.is_empty() {
+                return out("run_command needs a command.".into(), false);
+            }
+            let timeout = a["timeout"].as_u64().unwrap_or(computer::DEFAULT_TIMEOUT);
+            return match computer.run(command, timeout, &run.stop) {
+                Ok(r) => {
+                    let how = if r.timed_out {
+                        format!("Stopped after {:.0} s (the time limit; pass a longer timeout, up to {} s, or run it in the background with &)", r.secs, computer::MAX_TIMEOUT)
+                    } else if r.stopped {
+                        "Stopped by the user".to_string()
+                    } else {
+                        format!("Exit code {} ({:.1} s)", r.code.unwrap_or(-1), r.secs)
+                    };
+                    let body = if r.output.trim().is_empty() { "(no output)".to_string() } else { r.output };
+                    out(format!("{how}:\n{body}"), r.code == Some(0))
+                }
+                Err(e) => out(e, false),
+            };
+        }
+        let cmd = match name {
+            "browser_open" => json!({"do": "open", "url": a["url"]}),
+            "browser_click" => json!({"do": "click", "element": a["element"]}),
+            "browser_type" => json!({"do": "type", "element": a["element"], "text": a["text"], "submit": a["submit"]}),
+            "browser_scroll" => json!({"do": "scroll", "direction": a["direction"]}),
+            "browser_back" => json!({"do": "back"}),
+            _ => return out(format!("There's no tool called {name:?}."), false),
+        };
+        let mut page = match computer.browse(&cmd) {
+            Ok(p) => p,
+            Err(e) => return out(e, false),
+        };
+        if page["needs_approval"] == true {
+            let what = page["what"].as_str().unwrap_or("Send something from the browser").to_string();
+            match self.ask(bot, run, &what) {
+                Some(true) => {
+                    let mut again = cmd.clone();
+                    again["approved"] = true.into();
+                    page = match computer.browse(&again) {
+                        Ok(p) => p,
+                        Err(e) => return out(e, false),
+                    };
+                }
+                Some(false) => {
+                    *run.denied.lock().unwrap() = Some(what.clone());
+                    return out(
+                        format!("NOT DONE. The user said no to this: {what}. Nothing was typed or sent. In your reply, say plainly that you didn't do it because they said no, and ask what they'd like instead."),
+                        false,
+                    );
+                }
+                None if run.stop.load(Ordering::SeqCst) => return out("Not done: the user stopped you.".into(), false),
+                None => return out(format!("Not done: the user didn't answer within {} minutes ({what}). Tell them what you wanted to do.", APPROVAL_WAIT.as_secs() / 60), false),
+            }
+        }
+        if page["ok"] != true {
+            return out(page["error"].as_str().unwrap_or("The browser couldn't do that.").to_string(), false);
+        }
+        let shot = page["shot"].as_str().and_then(|s| computer.shot(s));
+        let saved = shot.is_some_and(|from| self.keep_shot(&bot.id, &from, tmsg_id));
+        let (t, cites) = describe_page(&page);
+        (tools::Outcome { text: t, citations: cites, ok: true }, saved)
+    }
+
+    /// Moves a screenshot into the Bot's folder (dropping the oldest past SHOTS_KEPT).
+    fn keep_shot(&self, id: &str, from: &Path, name: &str) -> bool {
+        let Some(d) = self.dir(id).map(|d| d.join("shots")) else { return false };
+        if std::fs::create_dir_all(&d).is_err() {
+            return false;
+        }
+        let to = d.join(format!("{name}.jpg"));
+        let ok = std::fs::copy(from, &to).is_ok();
+        let _ = std::fs::remove_file(from);
+        let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600));
+        let mut all: Vec<(std::time::SystemTime, PathBuf)> =
+            std::fs::read_dir(&d).into_iter().flatten().flatten().filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+        if all.len() > SHOTS_KEPT {
+            all.sort();
+            for (_, p) in &all[..all.len() - SHOTS_KEPT] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        ok
+    }
+
+    /// A screenshot of a Bot's, by its tool message's id.
+    pub fn shot(&self, id: &str, name: &str) -> Option<Vec<u8>> {
+        if !valid_id(name) {
+            return None;
+        }
+        std::fs::read(self.dir(id)?.join("shots").join(format!("{name}.jpg"))).ok()
+    }
+
     /// The tools that act on the Bot's own routines (the others are in tools.rs).
     fn routine_tool(&self, bot: &Bot, name: &str, args: &str) -> tools::Outcome {
         let a: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
@@ -647,12 +825,21 @@ impl Bots {
              - When you learn something lasting (a preference, a rule, a fact about the user or your job), save it with remember. Don't save one-off details.\n\
              - Do the work, then reply briefly: what you did and what you found. The user reads you on a phone, so keep it short and clear, and link your web sources.\n\
              - If something needs the user (a decision, a login, a missing detail), ask once, clearly.\n\
-             - You only act when the user writes or a routine starts you. For anything regular or later (\"every morning\", \"on Friday\"), propose a routine with schedule_routine; it runs once the user approves it. Never promise to do something later any other way.\n\n\
+             {computer}             - You only act when the user writes or a routine starts you. For anything regular or later (\"every morning\", \"on Friday\"), propose a routine with schedule_routine; it runs once the user approves it. Never promise to do something later any other way.\n\n\
              Your routines:\n{routines}\n\n\
              Current date and time: {now}",
             name = bot.name,
             job = if bot.job.is_empty() { "(none given yet: ask the user what they'd like you to do)" } else { &bot.job },
             memory = if memory.trim().is_empty() { "(nothing yet)".to_string() } else { memory.trim().to_string() },
+            computer = if self.has_computer(bot) {
+                "- You have a computer: a Linux box (Debian, Python 3 with pip, git, curl, jq) whose folder /workspace is your workspace. \
+                 run_command runs bash there (pip install --user works; anything outside /workspace is gone when the computer is idle for 10 minutes). \
+                 The browser tools drive a real Chromium: open a page, then use the numbered elements to click and type; use it when read_page isn't enough \
+                 (pages that need JavaScript, forms, several steps). It reaches public websites only. Submitting a form that sends data asks the user first. \
+                 If a command fails, fix it and run it again; report only what commands and pages actually showed.\n"
+            } else {
+                ""
+            },
             routines = {
                 let list = self.routines(&bot.id);
                 if list.is_empty() {
@@ -767,7 +954,7 @@ impl Bots {
     }
 
     fn steps(&self, bot: &Bot, run: &Run, endpoint: &brain::Endpoint) -> (usize, Result<(), String>) {
-        let tools = tools::definitions();
+        let tools = tools::definitions(self.has_computer(bot));
         let ctx = tools::Ctx { searxng: &self.searxng, workspace: &self.paths.workspace, memory: &self.paths.bots.join(&bot.id).join("memory.md") };
         let mut turns = 0;
         let mut since_user = 0;
@@ -848,14 +1035,24 @@ impl Bots {
                 return (turns, Ok(()));
             }
             for c in &turn.calls {
+                let tid = new_id();
                 // Every call gets a result, so the chat never holds a call a provider would refuse.
-                let out = if run.stop.load(Ordering::SeqCst) {
-                    tools::Outcome { text: "Not done: the user stopped you before this ran.".into(), citations: vec![], ok: false }
+                let (out, shot) = if run.stop.load(Ordering::SeqCst) {
+                    (tools::Outcome { text: "Not done: the user stopped you before this ran.".into(), citations: vec![], ok: false }, false)
                 } else {
                     run.push(json!({"type": "tool", "id": c.id, "name": c.name, "args": c.args}));
-                    if tools::ROUTINE_TOOLS.contains(&c.name.as_str()) { self.routine_tool(bot, &c.name, &c.args) } else { tools::run(&ctx, &c.name, &c.args) }
+                    if tools::ROUTINE_TOOLS.contains(&c.name.as_str()) {
+                        (self.routine_tool(bot, &c.name, &c.args), false)
+                    } else if tools::COMPUTER_TOOLS.contains(&c.name.as_str()) {
+                        self.computer_tool(bot, run, &c.name, &c.args, &tid)
+                    } else {
+                        (tools::run(&ctx, &c.name, &c.args), false)
+                    }
                 };
-                let mut tmsg = json!({"id": new_id(), "role": "tool", "call": c.id, "tool": c.name, "text": out.text, "at": at});
+                let mut tmsg = json!({"id": tid, "role": "tool", "call": c.id, "tool": c.name, "text": out.text, "at": at});
+                if shot {
+                    tmsg["shot"] = true.into();
+                }
                 if !out.citations.is_empty() {
                     tmsg["citations"] = out.citations.into();
                 }
@@ -864,6 +1061,16 @@ impl Bots {
                 }
                 self.append(&bot.id, &tmsg);
                 run.push(json!({"type": "message", "message": tmsg}));
+            }
+            // Said no: the turn ends here with a reply that says so (small models otherwise report the
+            // action as done, copying earlier turns where it was).
+            if let Some(what) = run.denied.lock().unwrap().take() {
+                let mut first = what.chars();
+                let lower: String = first.next().map(|c| c.to_lowercase().chain(first).collect()).unwrap_or_default();
+                let msg = json!({"id": new_id(), "role": "assistant", "text": format!("I didn't {lower}, because you said no. What would you like me to do instead?"), "at": now_ms(), "model": bot.model});
+                self.append(&bot.id, &msg);
+                run.push(json!({"type": "message", "message": msg}));
+                return (turns, Ok(()));
             }
             if !run.inbox.lock().unwrap().is_empty() {
                 since_user = 0;
@@ -885,4 +1092,34 @@ fn routine_prompt(routine: &Value, task: &str) -> String {
          If there's nothing worth telling them, reply with exactly: Nothing new.]\n\n{task}",
         late = late.unwrap_or_default()
     )
+}
+
+/// A browser page as the model reads it: where it is, its text, and the numbered elements.
+fn describe_page(p: &Value) -> (String, Vec<String>) {
+    let url = p["url"].as_str().unwrap_or("").to_string();
+    let mut t = format!("Page: {}\nAddress: {url}\n", p["title"].as_str().unwrap_or(""));
+    if let Some(note) = p["note"].as_str() {
+        t += &format!("{note}\n");
+    }
+    if let Some(y) = p["scroll"].as_array()
+        && let (Some(at), Some(height), Some(view)) = (y.first().and_then(Value::as_i64), y.get(1).and_then(Value::as_i64), y.get(2).and_then(Value::as_i64))
+        && height > view
+    {
+        t += &format!("Scrolled to {at} of {height} px.\n");
+    }
+    t += &format!("\nText{}:\n{}\n", if p["more_text"] == true { " (the start)" } else { "" }, p["text"].as_str().unwrap_or(""));
+    let elements: Vec<String> = p["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let e = e.as_array()?;
+            Some(format!("[{}] {} {:?}", e.first()?.as_i64()?, e.get(1)?.as_str()?, e.get(2)?.as_str()?))
+        })
+        .collect();
+    if !elements.is_empty() {
+        t += &format!("\nElements you can use (by number):\n{}\n", elements.join("\n"));
+    }
+    let cites = if url.starts_with("http") { vec![url] } else { vec![] };
+    (t, cites)
 }

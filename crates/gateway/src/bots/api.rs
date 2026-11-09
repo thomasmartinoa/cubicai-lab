@@ -16,6 +16,8 @@
 //! PUT    /v1/bots/<id>/routines/<rid>    change it, switch it on/off, {approved: true}
 //! DELETE /v1/bots/<id>/routines/<rid>    delete it (or decline a proposed one)
 //! POST   /v1/bots/<id>/routines/<rid>/run  run it now
+//! POST   /v1/bots/<id>/approval          {id, allow}: the user's answer to an action the Bot waits on
+//! GET    /v1/bots/<id>/shots/<msg id>    a browser screenshot (JPEG) from a tool step
 //! GET    /v1/bots/feed?after=MS          run ends and approvals since MS (the phone's notifications)
 //! GET    /v1/keys                        which cloud keys the PC has (never the keys)
 //! PUT    /v1/keys                        {xai?, gemini?, openrouter?, custom?, custom_url?} ("" removes)
@@ -139,7 +141,9 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             // A phone joining mid-run follows from the start of the current turn, so it sees all of
             // the words being written now; messages before that are in the list.
             let follow = run.as_ref().filter(|_| running).map(|r| r.resume_at());
-            conn.json(req, 200, &json!({"messages": bots.messages(id), "running": running, "follow": follow}))
+            // An action waiting for the user's yes, so a phone that opens the chat can answer it.
+            let approval = run.as_ref().filter(|_| running).and_then(|r| r.approval.lock().unwrap().clone()).map(|a| json!({"id": a["id"], "text": a["text"]}));
+            conn.json(req, 200, &json!({"messages": bots.messages(id), "running": running, "follow": follow, "approval": approval}))
         }
         ("POST", "messages") => {
             let v = read_body!();
@@ -164,6 +168,32 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             None => conn.json(req, 404, &error("The Bot isn't working on anything.")),
         },
         ("DELETE", "run") => conn.json(req, 200, &json!({"stopped": bots.stop(id)})),
+        ("POST", "approval") => {
+            let v = read_body!();
+            let ok = bots.answer(id, v["id"].as_str().unwrap_or(""), v["allow"].as_bool().unwrap_or(false));
+            if ok {
+                conn.json(req, 200, &json!({"ok": true}))
+            } else {
+                conn.json(req, 404, &error("That's no longer waiting for an answer."))
+            }
+        }
+        (_, sub) if method == "GET" && sub.starts_with("shots/") => {
+            let name = sub["shots/".len()..].trim_end_matches(".jpg");
+            match bots.shot(id, name) {
+                Some(bytes) => {
+                    let close = req.wants_close();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: private, max-age=86400\r\n{}\r\n",
+                        bytes.len(),
+                        if close { "Connection: close\r\n" } else { "" }
+                    );
+                    conn.raw(head.as_bytes())?;
+                    conn.raw(&bytes)?;
+                    Ok(!close)
+                }
+                None => conn.json(req, 404, &error("No such screenshot (it may have been cleared).")),
+            }
+        }
         ("GET", "routines") => conn.json(req, 200, &routines_json(bots, id)),
         ("POST", "routines") => {
             let v = read_body!();

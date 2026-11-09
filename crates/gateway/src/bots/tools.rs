@@ -11,6 +11,8 @@ pub const WRITE_FILE_BYTES: usize = 1024 * 1024;
 pub const LIST_ENTRIES: usize = 200;
 /// Tools the Bots engine runs itself (they change the Bot's routines).
 pub const ROUTINE_TOOLS: [&str; 2] = ["schedule_routine", "cancel_routine"];
+/// Tools for the Bots' computer (computer.rs), offered when a Bot has one.
+pub const COMPUTER_TOOLS: [&str; 6] = ["run_command", "browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back"];
 
 pub struct Ctx<'a> {
     pub searxng: &'a str,
@@ -36,8 +38,37 @@ fn function(name: &str, description: &str, properties: Value, required: &[&str])
     json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}})
 }
 
-/// The tools, in OpenAI's function format.
-pub fn definitions() -> Value {
+/// The tools, in OpenAI's function format (with the computer's when the Bot has one).
+pub fn definitions(computer: bool) -> Value {
+    let mut all = base_definitions();
+    if computer {
+        all.as_array_mut().unwrap().extend(computer_definitions().as_array().unwrap().iter().cloned());
+    }
+    all
+}
+
+fn computer_definitions() -> Value {
+    json!([
+        function(
+            "run_command",
+            "Run a bash command on your computer, in /workspace (your workspace). Returns its output and exit code. Use it for scripts, data, files, git, pip.",
+            json!({"command": {"type": "string", "description": "The bash command (or a short script)."}, "timeout": {"type": "integer", "description": "Seconds before it's stopped (default 120, up to 600)."}}),
+            &["command"],
+        ),
+        function("browser_open", "Open a web page in your computer's browser. Returns the page's text and its numbered elements (links, buttons, fields).", json!({"url": {"type": "string", "description": "The page's address."}}), &["url"]),
+        function("browser_click", "Click an element of the open page by its number.", json!({"element": {"type": "integer", "description": "The element's number from the page you were shown last."}}), &["element"]),
+        function(
+            "browser_type",
+            "Type into a field of the open page (replacing what's in it), optionally pressing Enter.",
+            json!({"element": {"type": "integer", "description": "The field's number."}, "text": {"type": "string", "description": "What to type."}, "submit": {"type": "boolean", "description": "Press Enter afterwards (e.g. to search)."}}),
+            &["element", "text"],
+        ),
+        function("browser_scroll", "Scroll the open page to see more of it.", json!({"direction": {"type": "string", "enum": ["down", "up"]}}), &[]),
+        function("browser_back", "Go back to the previous page.", json!({}), &[]),
+    ])
+}
+
+fn base_definitions() -> Value {
     json!([
         function("web_search", "Search the web. Returns the top results with their links and a snippet each; read a page for the details.", json!({"query": {"type": "string", "description": "What to search for, as you'd type it into a search engine."}}), &["query"]),
         function("read_page", "Read a public web page as plain text (the first few thousand characters).", json!({"url": {"type": "string", "description": "The page's full http(s) address."}}), &["url"]),

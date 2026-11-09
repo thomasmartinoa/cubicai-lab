@@ -99,6 +99,21 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
                 let words: Vec<Value> = (0..40).map(|i| text(&format!("w{i} "))).collect();
                 return sse(&mut c, &[words, vec![finish("stop")]].concat(), Duration::from_millis(40));
             }
+            if last["role"] == "user" && user.contains("shop") {
+                return sse(&mut c, &[call(0, "b1", "browser_open", r#"{"url": "https://shop.example"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "browser_open" {
+                return sse(&mut c, &[call(0, "b2", "browser_click", r#"{"element": 1}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "browser_click" {
+                return sse(&mut c, &[text("Done with the shop."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("terminal") {
+                return sse(&mut c, &[call(0, "t1", "run_command", r#"{"command": "echo from-computer; exit 3"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "run_command" {
+                return sse(&mut c, &[text("Ran it."), finish("stop")], Duration::ZERO);
+            }
             if last["role"] == "user" && user.contains("every morning") {
                 return sse(&mut c, &[call(0, "r1", "schedule_routine", r#"{"name": "Morning news", "task": "Give me the news (plain).", "kind": "daily", "time": "08:00"}"#), finish("tool_calls")], Duration::ZERO);
             }
@@ -166,10 +181,58 @@ impl Drop for Setup {
 }
 
 fn setup(name: &str) -> Setup {
+    setup_with(name, false)
+}
+
+/// A docker that answers like the computer would: the terminal runs locally in the workspace, the
+/// browser shows a shop page whose Buy button submits a POST form.
+fn fake_docker(dir: &std::path::Path) -> String {
+    let script = dir.join("docker");
+    let shots = dir.join("computer/shots");
+    let ws = dir.join("workspace");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/bash
+case "$1" in
+  image|rm|run) exit 0 ;;
+  inspect) echo true; exit 0 ;;
+esac
+args=" $* "
+if [[ "$args" == *" /opt/cubic/browse.py "* ]]; then
+  exec python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+shot = {{"ok": True, "url": "https://shop.example/", "title": "Shop", "text": "Socks 5 EUR", "elements": [[1, "button", "Buy"]], "shot": "/shots/s.jpg", "scroll": [0, 900, 900]}}
+if c.get("do") == "click" and not c.get("approved"):
+    print(json.dumps({{"ok": True, "needs_approval": True, "what": "Submit a form that sends data to shop.example (fields: card)"}}))
+    sys.exit()
+if c.get("do") == "click":
+    shot.update(title="Thanks", text="Order placed")
+open("{shots}/s.jpg", "wb").write(bytes([0xff, 0xd8, 0xff, 0xe0]))
+print(json.dumps(shot if c.get("do") != "ping" else {{"ok": True}}))
+'
+elif [[ "$args" == *" setsid "* ]]; then
+  cd "{ws}" && exec bash -c "${{@: -2:1}}"
+fi
+exit 0
+"#,
+            shots = shots.display(),
+            ws = ws.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    script.display().to_string()
+}
+
+fn setup_with(name: &str, computer: bool) -> Setup {
     let dir = std::env::temp_dir().join(format!("cubic-gw-bots-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (url, seen) = fake();
-    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace") };
+    let computer = computer.then(|| bots::computer::Setup { dir: dir.join("computer"), docker: fake_docker(&dir), name: "fake".into(), image: "fake".into() });
+    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer };
     let config = Config { dir: dir.join("config"), ollama: url.clone(), searxng: url.clone(), default_ctx: 16384, media: None, voice: None, bots: Some(paths) };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
@@ -497,6 +560,88 @@ fn a_bot_proposes_a_routine_and_waits_for_approval() {
     assert!(bots.add_routine(&bots.get(&id).unwrap(), &json!({"task": "x", "schedule": {"kind": "every", "hours": 1}}), "bot").is_err());
 }
 
+impl Setup {
+    /// Waits for the Bot to ask the user something, and returns {id, text}.
+    fn approval(&self, id: &str) -> Value {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = self.ask("GET", &format!("/v1/bots/{id}/messages"), None).json();
+            if r["approval"].is_object() {
+                return r["approval"].clone();
+            }
+            assert!(Instant::now() < end, "the Bot never asked");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn the_computer_runs_commands_and_asks_before_sending_a_form() {
+    let s = setup_with("computer", true);
+    s.custom_keys();
+    let id = s.make(json!({"name": "Shopper", "provider": "custom", "model": "test-model"}));
+
+    // The terminal: output and exit code.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "use the terminal"})));
+    let chat = s.settle(&id);
+    let ran = chat.iter().find(|m| m["tool"] == "run_command").unwrap();
+    assert!(ran["text"].as_str().unwrap().starts_with("Exit code 3 ("), "{}", ran["text"]);
+    assert!(ran["text"].as_str().unwrap().contains("from-computer"));
+    let sent = s.seen.lock().unwrap().cloud[0].clone();
+    let names: Vec<&str> = sent["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"run_command") && names.contains(&"browser_open"));
+    assert!(sent["messages"][0]["content"].as_str().unwrap().contains("You have a computer"));
+
+    // The browser: the page and its screenshot; the form waits for the user, who allows it.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "shop for socks"})));
+    let a = s.approval(&id);
+    assert!(a["text"].as_str().unwrap().contains("shop.example (fields: card)"), "{a}");
+    let feed = s.ask("GET", "/v1/bots/feed?after=0", None).json()["items"].as_array().unwrap().clone();
+    assert!(feed.iter().any(|f| f["kind"] == "approval" && f["text"].as_str().unwrap().starts_with("wants to submit a form")), "{feed:?}");
+    assert_eq!(s.ask("POST", &format!("/v1/bots/{id}/approval"), Some(json!({"id": "nope", "allow": true}))).status, 404);
+    assert_eq!(s.ask("POST", &format!("/v1/bots/{id}/approval"), Some(json!({"id": a["id"], "allow": true}))).status, 200);
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Done with the shop.");
+    let opened = chat.iter().find(|m| m["tool"] == "browser_open").unwrap();
+    assert!(opened["text"].as_str().unwrap().contains("[1] button \"Buy\""), "{}", opened["text"]);
+    assert_eq!(opened["shot"], true);
+    let clicked = chat.iter().find(|m| m["tool"] == "browser_click").unwrap();
+    assert!(clicked["text"].as_str().unwrap().starts_with("Page: Thanks"), "{}", clicked["text"]);
+    let shot = s.ask("GET", &format!("/v1/bots/{id}/shots/{}.jpg", opened["id"].as_str().unwrap()), None);
+    assert_eq!(shot.status, 200);
+    assert_eq!(s.ask("GET", &format!("/v1/bots/{id}/shots/..%2Fbot.json"), None).status, 404);
+    assert!(s.ask("GET", &format!("/v1/bots/{id}/messages"), None).json()["approval"].is_null());
+
+    // Said no: not done, and the model is told.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "shop again"})));
+    let a = s.approval(&id);
+    s.ask("POST", &format!("/v1/bots/{id}/approval"), Some(json!({"id": a["id"], "allow": false})));
+    let chat = s.settle(&id);
+    let refused = chat.iter().rev().find(|m| m["tool"] == "browser_click").unwrap();
+    assert!(refused["text"].as_str().unwrap().starts_with("NOT DONE. The user said no"), "{}", refused["text"]);
+    assert_eq!(
+        chat.last().unwrap()["text"],
+        "I didn't submit a form that sends data to shop.example (fields: card), because you said no. What would you like me to do instead?",
+        "the turn ends with the plain truth, not the model's account"
+    );
+
+    // Stop while it waits ends the run at once.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "shop once more"})));
+    s.approval(&id);
+    let t = Instant::now();
+    s.ask("DELETE", &format!("/v1/bots/{id}/run"), None);
+    s.settle(&id);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+
+    // Switched off for this Bot: no computer tools.
+    s.ask("PUT", &format!("/v1/bots/{id}"), Some(json!({"computer": false})));
+    let before = s.seen.lock().unwrap().cloud.len();
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "plain hello"})));
+    s.settle(&id);
+    let sent = s.seen.lock().unwrap().cloud[before].clone();
+    assert!(!sent["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "run_command"));
+}
+
 #[test]
 fn a_claimed_but_unsaved_file_gets_one_nudge() {
     let s = setup("nudge");
@@ -578,7 +723,7 @@ fn the_conversation_starts_at_the_user_and_cuts_old_results() {
 fn net_real_bot() {
     let dir = std::env::temp_dir().join(format!("cubic-gw-realbot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace") };
+    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer: None };
     let config = Config { media: None, bots: Some(paths), ..Config::from_env() };
     let id = identity::load(&config.dir).expect("this PC's gateway identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
@@ -606,4 +751,72 @@ fn net_real_bot() {
     assert!(ev.iter().any(|e| e["type"] == "tool" && e["name"] == "web_search"), "it searched");
     assert!(note.is_ok_and(|n| n.contains("1.")), "it saved the note");
     assert_eq!(ev.last().unwrap()["error"], Value::Null);
+}
+
+/// The real computer (needs Docker and `cubicai-gateway computer-setup`): terminal, files, the
+/// network rules, the browser, Stop. Uses its own container name and folders.
+#[test]
+#[ignore]
+fn net_real_computer() {
+    use cubic_gateway::bots::computer::{Computer, Setup};
+    use std::sync::atomic::AtomicBool;
+    let dir = std::env::temp_dir().join(format!("cubic-computer-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ws")).unwrap();
+    let setup = Setup { dir: dir.join("c"), docker: "docker".into(), name: "cubicai-computer-test".into(), image: "cubicai-computer:1".into() };
+    let c = Computer::new(&setup, &dir.join("ws"));
+    c.clean_start();
+    let no = AtomicBool::new(false);
+    let run = |cmd: &str| {
+        let r = c.run(cmd, 60, &no).unwrap();
+        eprintln!("$ {cmd}\n{}\n(exit {:?}, {:.1} s)", r.output, r.code, r.secs);
+        r
+    };
+    let started = Instant::now();
+    let r = run("id -u; pwd; python3 --version; echo hello > note.txt");
+    eprintln!("first command (with start) took {:.1} s", started.elapsed().as_secs_f64());
+    let uid = unsafe { libc_getuid() };
+    assert!(r.output.starts_with(&format!("{uid}\n/workspace\nPython 3.")), "{}", r.output);
+    let meta = std::fs::metadata(dir.join("ws/note.txt")).unwrap();
+    assert_eq!(std::os::unix::fs::MetadataExt::uid(&meta), uid, "files are the user's");
+    assert_ne!(run("touch /etc/x").code, Some(0), "the system is read-only");
+    assert_ne!(run("cat /proc/1/environ >/dev/null && ls /root").code, Some(0));
+    // Out only through the proxy, only to public websites.
+    assert_eq!(run("curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com").output.trim(), "200");
+    for blocked in ["http://192.168.0.1/", "https://127.0.0.1:8443/", "http://172.17.0.1/", "https://100.100.100.100/", "http://169.254.169.254/"] {
+        // Refused by the proxy, or (127.0.0.1 skips the proxy) by the container's own empty loopback.
+        let r = run(&format!("curl -sS -m 10 {blocked}"));
+        assert!(r.output.contains("public websites only") || r.output.contains("response 403") || r.output.contains("Could not connect"), "{blocked}: {}", r.output);
+    }
+    assert_ne!(run("curl -sS -m 5 --noproxy '*' https://1.1.1.1/").code, Some(0), "no network without the proxy");
+    assert_eq!(run("pip install --user -q cowsay >/dev/null 2>&1 && python3 -m cowsay -t moo | grep -c moo").output.trim(), "1", "pip goes through the proxy");
+    // The browser.
+    let page = c.browse(&json!({"do": "open", "url": "https://example.com"})).unwrap();
+    assert_eq!(page["title"], "Example Domain", "{page}");
+    assert!(page["elements"].as_array().unwrap().iter().any(|e| e[1] == "link"), "{page}");
+    let shot = c.shot(page["shot"].as_str().unwrap()).unwrap();
+    assert!(std::fs::read(&shot).unwrap().starts_with(&[0xff, 0xd8]), "a JPEG screenshot");
+    let refused = c.browse(&json!({"do": "open", "url": "http://192.168.0.1/"})).unwrap();
+    // The proxy's refusal is the page, so the model reads why.
+    assert!(refused["text"].as_str().unwrap_or("").contains("public websites only") || refused["ok"] == false, "{refused}");
+    // Stop ends a command and everything it started, inside the container too.
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        s2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let t = Instant::now();
+    let r = c.run("sleep 300 & sleep 300; echo never", 600, &stop).unwrap();
+    assert!(r.stopped && t.elapsed() < Duration::from_secs(5), "stopped in {:?}", t.elapsed());
+    assert_eq!(run("pgrep -c sleep || true").output.trim(), "0", "nothing left running");
+    let r = c.run("sleep 30", 2, &no).unwrap();
+    assert!(r.timed_out);
+    let _ = std::process::Command::new("docker").args(["rm", "-f", "cubicai-computer-test"]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
 }
