@@ -15,6 +15,7 @@ pub mod computer;
 pub mod google;
 pub mod groups;
 pub mod mcp;
+pub mod pictures;
 pub mod proxy;
 pub mod routines;
 pub mod skills;
@@ -1062,6 +1063,17 @@ impl Bots {
                 Err(e) => out(e, false),
             };
         }
+        if self.taken_over(&bot.id) {
+            // The user has this Bot's browser: wait for it back (Stop wakes), then the page has changed.
+            let end = std::time::Instant::now() + teach::IDLE;
+            while self.taken_over(&bot.id) && !run.stop.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            if run.stop.load(Ordering::SeqCst) {
+                return out("Not done: the user stopped you.".into(), false);
+            }
+            return out("The user took over your browser meanwhile and has handed it back (their message says what they did). This step wasn't run: the page has changed, so look at it again (browser_scroll) before going on.".into(), false);
+        }
         if self.teaching().is_some() {
             return out("The user is using the computer's browser right now (teaching a Bot a task). Try the browser again in a few minutes, or do without it.".into(), false);
         }
@@ -1099,7 +1111,7 @@ impl Bots {
     }
 
     /// Moves a screenshot into the Bot's folder (dropping the oldest past SHOTS_KEPT).
-    fn keep_shot(&self, id: &str, from: &Path, name: &str) -> bool {
+    pub(super) fn keep_shot(&self, id: &str, from: &Path, name: &str) -> bool {
         let Some(d) = self.dir(id).map(|d| d.join("shots")) else { return false };
         if std::fs::create_dir_all(&d).is_err() {
             return false;
@@ -1265,7 +1277,7 @@ impl Bots {
                     } else if m["from"].is_object() {
                         handoff_prompt(&m["from"], text)
                     } else if let Some(steps) = m["taught"].as_array() {
-                        teach::prompt(text, steps)
+                        if m["took_over"] == true { teach::takeover_prompt(text, steps) } else { teach::prompt(text, steps) }
                     } else {
                         text.to_string()
                     };
@@ -1305,7 +1317,7 @@ impl Bots {
                 _ => {}
             }
         }
-        out
+        results_first(out)
     }
 
     /// Where the Bot's model is, or why it can't be reached.
@@ -1375,6 +1387,9 @@ impl Bots {
         tools.as_array_mut().unwrap().extend(tools::team_definitions(others).as_array().unwrap().iter().cloned());
         if bot.phone {
             tools.as_array_mut().unwrap().extend(tools::phone_definitions().as_array().unwrap().iter().cloned());
+        }
+        if let Some((_, edit)) = self.picture_generators() {
+            tools.as_array_mut().unwrap().push(pictures::definition(edit.is_some()));
         }
         // The Bot's apps (MCP), asked once per run.
         let (apps, apps_down) = if bot.mcp.is_empty() { (vec![], vec![]) } else { self.mcp.offered(&bot.mcp, self.computer.as_ref()) };
@@ -1470,6 +1485,8 @@ impl Bots {
                         (self.skill_tool(bot, &c.name, &c.args), false)
                     } else if c.name == "ask_bot" {
                         (self.ask_bot(bot, run, &c.args), false)
+                    } else if c.name == "make_picture" {
+                        self.picture_tool(bot, run, &c.args, &tid)
                     } else if tools::COMPUTER_TOOLS.contains(&c.name.as_str()) {
                         self.computer_tool(bot, run, &c.name, &c.args, &tid)
                     } else if tools::GOOGLE_TOOLS.contains(&c.name.as_str()) {
@@ -1520,6 +1537,32 @@ pub struct View<'a> {
     pub skills: Vec<skills::Skill>,
 }
 
+/// A message the user sent while a tool ran is stored between the call and its result; providers
+/// want the results straight after the calls, so it moves to just after them.
+fn results_first(msgs: Vec<Value>) -> Vec<Value> {
+    let mut out = Vec::with_capacity(msgs.len());
+    let mut waiting: Vec<Value> = vec![];
+    let mut held: Vec<Value> = vec![];
+    for m in msgs {
+        if m["role"] == "tool" {
+            waiting.retain(|id| *id != m["tool_call_id"]);
+            out.push(m);
+            if waiting.is_empty() {
+                out.append(&mut held);
+            }
+        } else if !waiting.is_empty() {
+            held.push(m);
+        } else {
+            if let Some(calls) = m["tool_calls"].as_array() {
+                waiting = calls.iter().map(|c| c["id"].clone()).collect();
+            }
+            out.push(m);
+        }
+    }
+    out.append(&mut held);
+    out
+}
+
 /// A task another Bot handed over, as the model reads it.
 fn handoff_prompt(from: &Value, task: &str) -> String {
     let name = from["name"].as_str().unwrap_or("another Bot");
@@ -1557,7 +1600,13 @@ fn describe_page(p: &Value) -> (String, Vec<String>) {
     {
         t += &format!("Scrolled to {at} of {height} px.\n");
     }
-    t += &format!("\nText{}:\n{}\n", if p["more_text"] == true { " (the start)" } else { "" }, p["text"].as_str().unwrap_or(""));
+    let which = match (p["from_here"] == true, p["more_text"] == true) {
+        (true, true) => " (from where you've scrolled to; scroll for more)",
+        (true, false) => " (from where you've scrolled to)",
+        (false, true) => " (the start)",
+        _ => "",
+    };
+    t += &format!("\nText{which}:\n{}\n", p["text"].as_str().unwrap_or(""));
     let elements: Vec<String> = p["elements"]
         .as_array()
         .into_iter()
@@ -1947,3 +1996,23 @@ impl Bots {
 
 /// A loop guard for walking the handoff map.
 const MAX_SUBSTEPS: usize = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_sent_while_a_tool_ran_follows_its_result() {
+        let m = |v: Value| v;
+        let msgs = vec![
+            m(json!({"role": "user", "content": "go"})),
+            m(json!({"role": "assistant", "content": "", "tool_calls": [{"id": "a"}, {"id": "b"}]})),
+            m(json!({"role": "tool", "tool_call_id": "a", "content": "1"})),
+            m(json!({"role": "user", "content": "meanwhile"})),
+            m(json!({"role": "tool", "tool_call_id": "b", "content": "2"})),
+            m(json!({"role": "assistant", "content": "done"})),
+        ];
+        let order: Vec<String> = results_first(msgs).iter().map(|m| format!("{}:{}", m["role"].as_str().unwrap(), m["content"].as_str().unwrap())).collect();
+        assert_eq!(order, ["user:go", "assistant:", "tool:1", "tool:2", "user:meanwhile", "assistant:done"]);
+    }
+}

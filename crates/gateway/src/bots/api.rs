@@ -24,6 +24,9 @@
 //! GET    /v1/bots/<id>/teach/shot        the browser as it is now in that session (JPEG)
 //! POST   /v1/bots/<id>/teach/done        {what}: the steps go to the Bot, which writes a skill
 //! DELETE /v1/bots/<id>/teach             end the session, dropping the steps
+//!                                        (start with takeover: true to step in while the Bot works: its
+//!                                        browser tools wait; teach/done hands the browser back)
+//! GET    /v1/bots/<id>/screen            the computer's browser right now (JPEG), to watch a Bot work
 //! GET    /v1/groups                      group chats, each with whether it's working and its last message
 //! POST   /v1/groups                      {name, members: [bot ids]} (2–6 Bots)
 //! GET|PUT|DELETE /v1/groups/<id>         one group; change its name or members; delete it and its chat
@@ -86,7 +89,9 @@ fn group_summary(bots: &Bots, g: &super::groups::Group) -> Value {
 fn image<S: Read + Write + Timeouts>(conn: &mut Conn<S>, req: &Request, bytes: &[u8], cache: bool) -> io::Result<bool> {
     let close = req.wants_close();
     let head = format!(
-        "HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: {}\r\n{}\r\n",
+        "HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: {}\r\n{}\r\n",
+        // Screenshots are JPEG; a Bot's picture is whatever ComfyUI saved (PNG, WebP).
+        crate::media::mime(&crate::media::suffix(bytes, ".jpg")),
         bytes.len(),
         if cache { "private, max-age=86400" } else { "no-store" },
         if close { "Connection: close\r\n" } else { "" }
@@ -422,6 +427,10 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
                 Err(e) => conn.json(req, 400, &error(&e)),
             }
         }
+        ("GET", "screen") => match bots.screen() {
+            Ok(bytes) => image(conn, req, &bytes, false),
+            Err(e) => conn.json(req, 409, &error(&e)),
+        },
         ("GET", "teach/shot") => match bots.teach_shot(id) {
             Some(bytes) => image(conn, req, &bytes, false),
             None => conn.json(req, 404, &error("There's no picture of the browser yet.")),

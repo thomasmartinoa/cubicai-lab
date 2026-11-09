@@ -3,6 +3,10 @@
 //! to the Bot, which writes them up as a skill for the user to approve. One session at a time (there's
 //! one browser); while it lasts the Bots' own browser tools wait. What's typed into a password field
 //! is never written down.
+//!
+//! Taking over is the same session started with `takeover`: the user steps in while the Bot works
+//! (a login, a captcha, a page it's stuck on). That Bot's browser tools wait until the user hands the
+//! browser back; then their steps reach the Bot as a message (`took_over`) and it carries on.
 
 use super::{now_ms, new_id, Bots, Thread};
 use serde_json::{json, Value};
@@ -16,6 +20,8 @@ pub const MAX_STEPS: usize = 80;
 
 pub struct Teach {
     pub bot: String,
+    /// Taking over from the Bot mid-task (not teaching it a skill).
+    pub takeover: bool,
     pub steps: Vec<String>,
     last: Instant,
     url: String,
@@ -34,6 +40,17 @@ pub fn prompt(what: &str, steps: &[Value]) -> String {
          (say what changes each time, like a search term or a date, what to check at the end, and what to do if a step fails; describe elements by their labels, not by position). \
          Don't redo the task now unless they asked. Then tell them in a line or two what you saved.]",
         list.join("\n")
+    )
+}
+
+/// The user's steps after taking over, as the model reads them.
+pub fn takeover_prompt(what: &str, steps: &[Value]) -> String {
+    let list: Vec<String> = steps.iter().filter_map(|s| s.as_str()).enumerate().map(|(i, s)| format!("{}. {s}", i + 1)).collect();
+    let did = if list.is_empty() { "They didn't change anything.".to_string() } else { format!("What they did:\n{}", list.join("\n")) };
+    let said = if what.trim().is_empty() { String::new() } else { format!("\nThey add: {}", what.trim()) };
+    format!(
+        "[The user took over your computer's browser while you worked and has handed it back. {did}{said}\n\n\
+         The browser is on the page they left it on. Carry on with your task from there: look at the page first (browser_scroll), since element numbers have changed.]"
     )
 }
 
@@ -89,7 +106,7 @@ impl Bots {
     }
 
     fn teach_state(&self, s: &Teach, error: Option<String>) -> Value {
-        json!({"teaching": true, "bot": s.bot, "url": s.url, "title": s.title, "steps": s.steps, "shot": s.n, "error": error})
+        json!({"teaching": true, "bot": s.bot, "takeover": s.takeover, "url": s.url, "title": s.title, "steps": s.steps, "shot": s.n, "error": error})
     }
 
     /// The phone's teaching step: {do: start|look|open|tap|text|key|scroll|back, …} → where the
@@ -117,10 +134,19 @@ impl Bots {
         {
             let mut t = self.teach.lock().unwrap();
             let live = t.as_ref().is_some_and(|s| s.last.elapsed() <= IDLE);
+            let takeover = v["takeover"] == true;
             match t.as_mut() {
-                Some(s) if live && s.bot == id => s.last = Instant::now(),
+                Some(s) if live && s.bot == id => {
+                    s.last = Instant::now();
+                    if what == "start" {
+                        s.takeover = takeover;
+                    }
+                }
+                Some(s) if live && what == "start" && s.takeover => {
+                    return Err("You're holding another Bot's browser: hand it back first.".into());
+                }
                 // Starting (or teaching another Bot) begins afresh; anything else needs a session.
-                _ if what == "start" => *t = Some(Teach { bot: id.into(), steps: vec![], last: Instant::now(), url: String::new(), title: String::new(), n: 0 }),
+                _ if what == "start" => *t = Some(Teach { bot: id.into(), takeover, steps: vec![], last: Instant::now(), url: String::new(), title: String::new(), n: 0 }),
                 _ => return Err("The teaching session is over (it ends after 10 minutes untouched). Start again.".into()),
             }
         }
@@ -159,6 +185,25 @@ impl Bots {
         Ok(self.teach_state(s, None))
     }
 
+    /// Whether the user has taken this Bot's browser over (its browser tools wait meanwhile).
+    pub fn taken_over(&self, id: &str) -> bool {
+        let t = self.teach.lock().unwrap();
+        t.as_ref().is_some_and(|s| s.takeover && s.bot == id && s.last.elapsed() <= IDLE)
+    }
+
+    /// The browser right now, for watching a Bot work (JPEG). Never starts the computer.
+    pub fn screen(&self) -> Result<Vec<u8>, String> {
+        let computer = self.computer.as_ref().filter(|c| c.available()).ok_or("The Bots' computer isn't set up on this PC.")?;
+        if !computer.running() {
+            return Err("The computer is off: the Bot isn't using it right now.".into());
+        }
+        let page = computer.browse(&json!({"do": "shot"}))?;
+        let from = page["shot"].as_str().and_then(|p| computer.shot(p)).ok_or("The browser gave no picture.")?;
+        let bytes = std::fs::read(&from).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(from);
+        bytes
+    }
+
     /// The browser as the user last saw it while teaching this Bot (JPEG).
     pub fn teach_shot(&self, id: &str) -> Option<Vec<u8>> {
         std::fs::read(self.dir(id)?.join("teach.jpg")).ok()
@@ -181,6 +226,9 @@ impl Bots {
     /// starts it writing the skill.
     pub fn teach_done(self: &Arc<Bots>, id: &str, what: &str) -> Result<Value, String> {
         let bot = self.get(id).ok_or("No such Bot.")?;
+        if self.taken_over(id) {
+            return self.hand_back(&bot, what);
+        }
         let steps = {
             let mut t = self.teach.lock().unwrap();
             match t.take() {
@@ -203,6 +251,26 @@ impl Bots {
         let msg = json!({"id": new_id(), "role": "user", "text": text, "at": now_ms(), "taught": steps});
         crate::log(&format!("bot {} was taught a task ({} steps)", bot.id, msg["taught"].as_array().map(Vec::len).unwrap_or(0)));
         Ok(self.launch(Thread::Bot(bot.id.clone()), msg, |_| {}).0)
+    }
+}
+
+impl Bots {
+    /// The user hands the browser back after taking over: their steps (and words) go to the Bot as a
+    /// message before the session ends, so the browser tool that waited finds them in the chat.
+    fn hand_back(self: &Arc<Bots>, bot: &super::Bot, what: &str) -> Result<Value, String> {
+        let steps = self.teach.lock().unwrap().as_ref().map(|s| s.steps.clone()).unwrap_or_default();
+        let what: String = what.trim().chars().take(2000).collect();
+        let mut out = json!({"ended": true});
+        if !steps.is_empty() || !what.is_empty() {
+            let msg = json!({"id": new_id(), "role": "user", "text": what, "at": now_ms(), "taught": steps, "took_over": true});
+            out = self.launch(Thread::Bot(bot.id.clone()), msg, |_| {}).0;
+        }
+        *self.teach.lock().unwrap() = None;
+        if let Some(d) = self.dir(&bot.id) {
+            let _ = std::fs::remove_file(d.join("teach.jpg"));
+        }
+        crate::log(&format!("bot {} got its browser back ({} steps)", bot.id, steps.len()));
+        Ok(out)
     }
 }
 

@@ -45,6 +45,52 @@ MARK = """
 }
 """ % MAX_ELEMENTS
 
+# The text from the top of the screen down, paragraph by paragraph, once the page has been scrolled
+# (body.innerText always starts at the top, so a scrolled page read the same as an unscrolled one).
+FROM_HERE = r"""
+(limit) => {
+  const blockOf = (el) => {
+    while (el && el !== document.body) {
+      const d = getComputedStyle(el).display;
+      if (!d.startsWith('inline') && d !== 'contents') return el;
+      el = el.parentElement;
+    }
+    return document.body;
+  };
+  // Menus and contents lists pinned on screen (fixed, sticky) would come first on every scroll.
+  const seen = new Map();
+  const pinned = (el) => {
+    const path = [];
+    let hit = false;
+    for (let e = el; e && e !== document.body; e = e.parentElement) {
+      if (seen.has(e)) { hit = seen.get(e); break; }
+      path.push(e);
+      const pos = getComputedStyle(e).position;
+      if (pos === 'fixed' || pos === 'sticky') { hit = true; break; }
+    }
+    path.forEach((e) => seen.set(e, hit));
+    return hit;
+  };
+  const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n, out = '', last = null, started = false;
+  while ((n = w.nextNode())) {
+    const el = n.parentElement;
+    if (!el || ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(el.tagName)) continue;
+    const t = n.textContent.replace(/\s+/g, ' ');
+    if (!t.trim() || !el.getClientRects().length || pinned(el)) continue;
+    if (!started) {
+      if (el.getBoundingClientRect().bottom < 0) continue;
+      started = true;
+    }
+    const b = blockOf(el);
+    out += (b !== last && out ? '\n' : '') + t;
+    last = b;
+    if (out.length > limit) break;
+  }
+  return out;
+}
+"""
+
 SENDS = """
 (e) => {
   const form = e.form || e.closest('form');
@@ -135,8 +181,13 @@ def settle(p):
 
 def view(p, note=None):
     elements = p.evaluate(MARK)
+    scrolled = False
     try:
-        text = p.inner_text("body")
+        if p.evaluate("() => scrollY") > 40:
+            text = p.evaluate(FROM_HERE, TEXT_CHARS + 1)
+            scrolled = True
+        else:
+            text = p.inner_text("body")
     except Exception:
         text = ""
     text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
@@ -148,7 +199,7 @@ def view(p, note=None):
         shot = None
     y = p.evaluate("() => [Math.round(scrollY), document.documentElement.scrollHeight, innerHeight]")
     return {
-        "ok": True, "url": p.url, "title": p.title(), "text": text[:TEXT_CHARS], "more_text": len(text) > TEXT_CHARS,
+        "ok": True, "url": p.url, "title": p.title(), "text": text[:TEXT_CHARS], "more_text": len(text) > TEXT_CHARS, "from_here": scrolled,
         "elements": elements, "shot": shot, "scroll": y, "note": note,
     }
 

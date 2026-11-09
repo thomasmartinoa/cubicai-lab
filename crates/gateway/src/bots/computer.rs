@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub const IMAGE: &str = "cubicai-computer:3";
+pub const IMAGE: &str = "cubicai-computer:4";
 pub const NAME: &str = "cubicai-computer";
 /// Stopped after this long without a command.
 pub const IDLE: Duration = Duration::from_secs(600);
@@ -116,7 +116,7 @@ impl Computer {
         yes
     }
 
-    fn running(&self) -> bool {
+    pub fn running(&self) -> bool {
         self.docker().args(["inspect", "-f", "{{.State.Running}}", &self.name]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
     }
 

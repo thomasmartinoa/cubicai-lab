@@ -112,6 +112,20 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
             if system.starts_with("You are Writer,") && last["role"] == "user" && lc.contains("who's free") {
                 return sse(&mut c, &[text("Writer here."), finish("stop")], Duration::ZERO);
             }
+            // Pictures: one made, one that fails, one saved outside the workspace.
+            if last["role"] == "user" && user.contains("draw") {
+                let args = if user.contains("broken") {
+                    r#"{"prompt": "FAIL a tea shop"}"#
+                } else if user.contains("outside") {
+                    r#"{"prompt": "a tea shop", "save_as": "../escape.png"}"#
+                } else {
+                    r#"{"prompt": "A tea shop by the river, watercolour", "shape": "landscape"}"#
+                };
+                return sse(&mut c, &[call(0, "p1", "make_picture", args), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "make_picture" {
+                return sse(&mut c, &[text("Here it is."), finish("stop")], Duration::ZERO);
+            }
             // Handoffs: Scout hands a haiku to Writer.
             if last["role"] == "user" && user.contains("ask the writer") {
                 return sse(&mut c, &[call(0, "h1", "ask_bot", r#"{"bot": "writer", "task": "Write a haiku about rain."}"#), finish("tool_calls")], Duration::ZERO);
@@ -150,6 +164,9 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
             }
             if last["role"] == "user" && user.contains("shop") {
                 return sse(&mut c, &[call(0, "b1", "browser_open", r#"{"url": "https://shop.example"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "user" && lc.contains("took over your computer's browser") {
+                return sse(&mut c, &[text("Thanks, carrying on from the checkout."), finish("stop")], Duration::ZERO);
             }
             if last["role"] == "tool" && last["name"] == "browser_open" {
                 return sse(&mut c, &[call(0, "b2", "browser_click", r#"{"element": 1}"#), finish("tool_calls")], Duration::ZERO);
@@ -395,12 +412,18 @@ exit 0
 }
 
 fn setup_with(name: &str, computer: bool) -> Setup {
+    setup_full(name, computer, false)
+}
+
+/// With `media`, a fake ComfyUI for making pictures.
+fn setup_full(name: &str, computer: bool, media: bool) -> Setup {
     let dir = std::env::temp_dir().join(format!("cubic-gw-bots-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    let media = media.then(|| common::comfy::setup(&dir).0);
     let (url, seen) = fake();
     let computer = computer.then(|| bots::computer::Setup { dir: dir.join("computer"), docker: fake_docker(&dir), name: "fake".into(), image: "fake".into() });
     let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer, google: Some(format!("{url}/g")) };
-    let config = Config { dir: dir.join("config"), ollama: url.clone(), searxng: url.clone(), default_ctx: 16384, media: None, voice: None, bots: Some(paths) };
+    let config = Config { dir: dir.join("config"), ollama: url.clone(), searxng: url.clone(), default_ctx: 16384, media, voice: None, bots: Some(paths) };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
     Setup { gw, token: id.token, pin: id.fingerprint, seen, dir, url }
@@ -1225,6 +1248,50 @@ fn skills_are_called_proposed_and_approved() {
 }
 
 #[test]
+fn a_bot_makes_a_picture_into_the_workspace() {
+    // Without ComfyUI there's no picture tool.
+    let s = setup("nopics");
+    s.custom_keys();
+    let id = s.make(json!({"name": "Artist", "provider": "custom", "model": "test-model"}));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "hello"})));
+    s.settle(&id);
+    let tools = s.seen.lock().unwrap().cloud[0]["tools"].clone();
+    assert!(!tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == "make_picture"));
+    drop(s);
+
+    let s = setup_full("pics", false, true);
+    s.custom_keys();
+    let id = s.make(json!({"name": "Artist", "provider": "custom", "model": "test-model"}));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "draw me a tea shop"})));
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Here it is.");
+    let tool = chat.iter().find(|m| m["tool"] == "make_picture").unwrap();
+    assert_eq!(tool["text"], "Made the picture and saved it as pictures/a-tea-shop-by-the.png in the workspace. The user sees it in the chat; don't describe it at length.");
+    assert_eq!(tool["shot"], true);
+    assert_eq!(std::fs::read(s.dir.join("workspace/pictures/a-tea-shop-by-the.png")).unwrap(), common::comfy::PNG);
+    // The phone gets it beside the step, as a PNG.
+    let r = s.ask("GET", &format!("/v1/bots/{id}/shots/{}.jpg", tool["id"].as_str().unwrap()), None);
+    assert_eq!((r.status, r.header("Content-Type")), (200, Some("image/png")));
+    // The tool is offered (no edit model here, so no edit argument).
+    let def = s.seen.lock().unwrap().cloud[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "make_picture").cloned().unwrap();
+    assert!(def["function"]["parameters"]["properties"].get("edit").is_none());
+    // Again: a new name, never over the first.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "draw it again"})));
+    s.settle(&id);
+    assert!(s.dir.join("workspace/pictures/a-tea-shop-by-the-2.png").exists());
+    // ComfyUI's error comes back; a path outside the workspace is refused.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "draw something broken"})));
+    let chat = s.settle(&id);
+    let failed = chat.iter().rev().find(|m| m["tool"] == "make_picture").unwrap();
+    assert!(failed["text"].as_str().unwrap().starts_with("The picture failed:") && failed["failed"] == true, "{failed}");
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "draw it outside"})));
+    let chat = s.settle(&id);
+    let refused = chat.iter().rev().find(|m| m["tool"] == "make_picture").unwrap();
+    assert_eq!(refused["failed"], true, "{refused}");
+    assert!(!s.dir.join("escape.png").exists());
+}
+
+#[test]
 fn a_bot_hands_a_task_to_another_and_gets_the_answer() {
     let s = setup("handoff");
     s.custom_keys();
@@ -1305,6 +1372,36 @@ fn groups_answer_by_mention_hand_on_and_route() {
     assert_eq!(s.ask("GET", &format!("/v1/groups/{gid}"), None).json()["group"]["members"], json!([wri]));
     assert_eq!(s.ask("DELETE", &format!("/v1/groups/{gid}"), None).status, 200);
     assert_eq!(s.ask("GET", &format!("/v1/groups/{gid}/messages"), None).status, 404);
+}
+
+#[test]
+fn the_user_takes_over_the_browser_and_hands_it_back() {
+    let s = setup_with("takeover", true);
+    s.custom_keys();
+    let id = s.make(json!({"name": "Shopper", "provider": "custom", "model": "test-model"}));
+    let st = s.ask("POST", &format!("/v1/bots/{id}/teach"), Some(json!({"do": "start", "takeover": true}))).json();
+    assert_eq!(st["takeover"], true);
+    assert_eq!(s.ask("GET", &format!("/v1/bots/{id}/screen"), None).status, 200);
+    // The Bot's browser step waits while the user has it.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "buy it at the shop"})));
+    std::thread::sleep(Duration::from_millis(600));
+    let r = s.ask("GET", &format!("/v1/bots/{id}/messages"), None).json();
+    assert_eq!(r["running"], true);
+    assert!(!r["messages"].as_array().unwrap().iter().any(|m| m["tool"] == "browser_open"), "the step waits");
+    s.ask("POST", &format!("/v1/bots/{id}/teach"), Some(json!({"do": "tap", "x": 0.5, "y": 0.1})));
+    let r = s.ask("POST", &format!("/v1/bots/{id}/teach/done"), Some(json!({"what": "I logged in for you"})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let chat = s.settle(&id);
+    let waited = chat.iter().find(|m| m["tool"] == "browser_open").unwrap();
+    assert!(waited["text"].as_str().unwrap().starts_with("The user took over your browser meanwhile"), "{waited}");
+    let back = chat.iter().find(|m| m["took_over"] == true).unwrap();
+    assert_eq!((back["text"].clone(), back["taught"][0].clone()), (json!("I logged in for you"), json!("Clicked the button “Search”")));
+    assert_eq!(chat.last().unwrap()["text"], "Thanks, carrying on from the checkout.");
+    // The model got the result straight after its call, then the user's hand-back.
+    let sent = s.seen.lock().unwrap().cloud.last().unwrap()["messages"].clone();
+    let roles: Vec<&str> = sent.as_array().unwrap().iter().skip(1).map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "user"]);
+    assert!(s.gw.gateway.bots.as_ref().unwrap().teaching().is_none());
 }
 
 #[test]

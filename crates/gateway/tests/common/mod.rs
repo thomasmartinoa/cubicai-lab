@@ -1,6 +1,8 @@
 //! A client like the phone's: TLS 1.3 to a certificate pinned by its fingerprint, plain HTTP/1.1.
 #![allow(dead_code)]
 
+pub mod comfy;
+
 use cubic_gateway::identity;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
