@@ -6,6 +6,7 @@
 //!     cubicai-gateway rotate                             new token (un-pairs every phone)
 //!     cubicai-gateway voice-setup                        download what voice calls need
 //!     cubicai-gateway computer-setup                     build the Bots' computer (Docker)
+//!     cubicai-gateway google-login <client_secret.json>  connect your Google account for Bots
 //!     cubicai-gateway install                            run this gateway as the cubicai-server service
 
 use cubic_gateway::{access, identity, log, settings::Settings, Config, DEFAULT_PORT};
@@ -25,7 +26,11 @@ fn main() {
         }),
         Some("voice-setup") => cubic_gateway::voice::setup(&cubic_gateway::voice::Paths::from_env()),
         Some("computer-setup") => cubic_gateway::bots::computer::setup(),
-        Some(other) => Err(format!("unknown command {other:?}: use serve, pair, remote on|off|status, rotate, voice-setup, computer-setup or install")),
+        Some("google-login") => match args.get(1) {
+            Some(f) => cubic_gateway::bots::google::login(&config.dir, std::path::Path::new(f)),
+            None => Err("google-login needs the client JSON file you downloaded from Google Cloud (Clients → your Desktop client → Download JSON)".into()),
+        },
+        Some(other) => Err(format!("unknown command {other:?}: use serve, pair, remote on|off|status, rotate, voice-setup, computer-setup, google-login or install")),
     };
     if let Err(e) = result {
         eprintln!("cubicai-gateway: {e}");

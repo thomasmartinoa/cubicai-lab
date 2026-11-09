@@ -17,8 +17,20 @@
 //! DELETE /v1/bots/<id>/routines/<rid>    delete it (or decline a proposed one)
 //! POST   /v1/bots/<id>/routines/<rid>/run  run it now
 //! POST   /v1/bots/<id>/approval          {id, allow}: the user's answer to an action the Bot waits on
+//! POST   /v1/bots/<id>/phone             {id, answer}: the phone's answer to a question (location, status)
 //! GET    /v1/bots/<id>/shots/<msg id>    a browser screenshot (JPEG) from a tool step
 //! GET    /v1/bots/feed?after=MS          run ends and approvals since MS (the phone's notifications)
+//! GET    /v1/google                      {connected, email} or {connected: false, client: bool}
+//! PUT    /v1/google                      {client_id, client_secret}: the user's Google Cloud client
+//! POST   /v1/google/start                {redirect}: a sign-in; gives {url} to open in a browser
+//! POST   /v1/google/finish               {code, state}: what Google sent back to the redirect
+//! DELETE /v1/google                      sign out (revokes the token)
+//! GET    /v1/mcp                         the user's apps (MCP servers; header/env names, never values)
+//! POST   /v1/mcp                         add one {name, kind: remote|sandbox, url|command, headers|env, ask}
+//!                                        → {server, tools} or {server, error} (it's tried at once)
+//! PUT    /v1/mcp/<id>                    change it (headers/env merged, "" removes one)
+//! DELETE /v1/mcp/<id>                    remove it
+//! GET    /v1/mcp/<id>/tools              its tools, asked afresh
 //! GET    /v1/keys                        which cloud keys the PC has (never the keys)
 //! PUT    /v1/keys                        {xai?, gemini?, openrouter?, custom?, custom_url?} ("" removes)
 //! ```
@@ -34,7 +46,7 @@ use std::time::Duration;
 const MAX_BOT_BODY: usize = 1024 * 1024;
 
 pub fn handles(path: &str) -> bool {
-    path == "/v1/keys" || path == "/v1/bots" || path.starts_with("/v1/bots/")
+    path == "/v1/keys" || path == "/v1/bots" || path.starts_with("/v1/bots/") || path == "/v1/google" || path.starts_with("/v1/google/") || path == "/v1/mcp" || path.starts_with("/v1/mcp/")
 }
 
 fn body<S: Read + Write>(conn: &mut Conn<S>, req: &Request) -> Result<Value, (u16, String)> {
@@ -81,6 +93,92 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
                     Err(e) => conn.json(req, 400, &error(&e)),
                 }
             }
+            _ => conn.json(req, 404, &error("Not found")),
+        };
+    }
+    if path == "/v1/google" || path.starts_with("/v1/google/") {
+        let g = &bots.google;
+        return match (method, path) {
+            ("GET", "/v1/google") => conn.json(req, 200, &g.status()),
+            ("PUT", "/v1/google") => {
+                let v = read_body!();
+                let pair = super::google::client_from_json(v.to_string().as_bytes());
+                match pair.and_then(|(id, secret)| g.set_client(&id, &secret)) {
+                    Ok(()) => conn.json(req, 200, &g.status()),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("DELETE", "/v1/google") => {
+                g.sign_out();
+                crate::log("google: signed out");
+                conn.json(req, 200, &g.status())
+            }
+            ("POST", "/v1/google/start") => {
+                let v = read_body!();
+                match g.start(v["redirect"].as_str().unwrap_or("")) {
+                    Ok(url) => conn.json(req, 200, &json!({"url": url})),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("POST", "/v1/google/finish") => {
+                let v = read_body!();
+                match g.finish(v["code"].as_str().unwrap_or(""), v["state"].as_str().unwrap_or("")) {
+                    Ok(note) => {
+                        crate::log("google: signed in");
+                        let mut st = g.status();
+                        st["note"] = note.into();
+                        conn.json(req, 200, &st)
+                    }
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            _ => conn.json(req, 404, &error("Not found")),
+        };
+    }
+    if path == "/v1/mcp" || path.starts_with("/v1/mcp/") {
+        let m = &bots.mcp;
+        let rest: Vec<&str> = path.trim_start_matches("/v1/mcp").trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+        let tools_of = |s: &super::mcp::Server| -> Value {
+            match m.tools(s, bots.computer.as_ref(), true) {
+                Ok(t) => json!({"server": s.to_public(), "tools": t.iter().map(|t| json!({"name": t.name, "description": t.description, "read_only": t.read_only})).collect::<Vec<_>>()}),
+                Err(e) => json!({"server": s.to_public(), "error": e}),
+            }
+        };
+        return match (method, rest.as_slice()) {
+            ("GET", []) => conn.json(req, 200, &json!({"servers": m.servers().iter().map(|s| s.to_public()).collect::<Vec<_>>()})),
+            ("POST", []) => {
+                let v = read_body!();
+                match m.add(&v) {
+                    Ok(s) => {
+                        crate::log(&format!("mcp {}: added", s.id));
+                        let out = tools_of(&s);
+                        conn.json(req, 200, &out)
+                    }
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("PUT", [id]) => {
+                let v = read_body!();
+                match m.update(id, &v) {
+                    Ok(s) => conn.json(req, 200, &json!({"server": s.to_public()})),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("DELETE", [id]) => {
+                if m.delete(id) {
+                    crate::log(&format!("mcp {id}: removed"));
+                    conn.json(req, 200, &json!({"ok": true}))
+                } else {
+                    conn.json(req, 404, &error("There's no such app."))
+                }
+            }
+            ("GET", [id, "tools"]) => match m.server(id) {
+                Some(s) => {
+                    let out = tools_of(&s);
+                    conn.json(req, 200, &out)
+                }
+                None => conn.json(req, 404, &error("There's no such app.")),
+            },
             _ => conn.json(req, 404, &error("Not found")),
         };
     }
@@ -143,7 +241,8 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             let follow = run.as_ref().filter(|_| running).map(|r| r.resume_at());
             // An action waiting for the user's yes, so a phone that opens the chat can answer it.
             let approval = run.as_ref().filter(|_| running).and_then(|r| r.approval.lock().unwrap().clone()).map(|a| json!({"id": a["id"], "text": a["text"]}));
-            conn.json(req, 200, &json!({"messages": bots.messages(id), "running": running, "follow": follow, "approval": approval}))
+            let phone = run.as_ref().filter(|_| running).and_then(|r| r.phone.lock().unwrap().clone()).filter(|p| p.get("answer").is_none());
+            conn.json(req, 200, &json!({"messages": bots.messages(id), "running": running, "follow": follow, "approval": approval, "phone": phone}))
         }
         ("POST", "messages") => {
             let v = read_body!();
@@ -168,6 +267,14 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             None => conn.json(req, 404, &error("The Bot isn't working on anything.")),
         },
         ("DELETE", "run") => conn.json(req, 200, &json!({"stopped": bots.stop(id)})),
+        ("POST", "phone") => {
+            let v = read_body!();
+            if bots.phone_answer(id, v["id"].as_str().unwrap_or(""), v["answer"].clone()) {
+                conn.json(req, 200, &json!({"ok": true}))
+            } else {
+                conn.json(req, 404, &error("That's no longer waiting for an answer."))
+            }
+        }
         ("POST", "approval") => {
             let v = read_body!();
             let ok = bots.answer(id, v["id"].as_str().unwrap_or(""), v["allow"].as_bool().unwrap_or(false));

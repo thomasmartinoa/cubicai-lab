@@ -20,6 +20,10 @@ struct Seen {
     cloud: Vec<Value>,
     ollama: Vec<Value>,
     auth: Vec<String>,
+    /// Google calls: (method path?query, Authorization, body).
+    google: Vec<(String, String, String)>,
+    /// MCP calls: (method, session id, Authorization).
+    mcp: Vec<(String, String, String)>,
 }
 
 fn fake() -> (String, Arc<Mutex<Seen>>) {
@@ -75,10 +79,17 @@ fn last_user(body: &Value) -> String {
 fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
     let mut c = Conn::new(tcp);
     let Ok(Some(req)) = c.next_request() else { return };
-    let body: Value = match req.content_length() {
-        Ok(Some(n)) if n > 0 => serde_json::from_slice(&c.read_body(n).unwrap()).unwrap_or(Value::Null),
-        _ => Value::Null,
+    let raw = match req.content_length() {
+        Ok(Some(n)) if n > 0 => c.read_body(n).unwrap(),
+        _ => vec![],
     };
+    let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    if req.path().starts_with("/g/") {
+        return fake_google(&mut c, &req, &String::from_utf8_lossy(&raw), &seen);
+    }
+    if req.path() == "/mcp" {
+        return fake_mcp(&mut c, &req, &body, &seen);
+    }
     match req.path() {
         "/chat/completions" => {
             seen.lock().unwrap().cloud.push(body.clone());
@@ -113,6 +124,37 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
             }
             if last["role"] == "tool" && last["name"] == "run_command" {
                 return sse(&mut c, &[text("Ran it."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("my mail") {
+                return sse(&mut c, &[call(0, "g1", "gmail_search", r#"{"query": "is:unread"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "gmail_search" {
+                return sse(&mut c, &[call(0, "g2", "gmail_read", r#"{"id": "m1"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "gmail_read" {
+                return sse(&mut c, &[call(0, "g3", "gmail_send", r#"{"to": "bob@example.com", "body": "Yes, noon works.", "reply_to_id": "m1"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "gmail_send" {
+                return sse(&mut c, &[text("Replied to Bob."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("file the bug") {
+                return sse(&mut c, &[call(0, "m1", "github__get_issue", r#"{"number": 7}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "github__get_issue" {
+                return sse(&mut c, &[call(0, "m2", "github__create_issue", r#"{"title": "Login broken again"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "github__create_issue" {
+                return sse(&mut c, &[text("Filed it."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("remind me") {
+                let at = format!("{}T18:30", cubic_gateway::time::local(cubic_gateway::time::now() as i64 + 86400).date());
+                return sse(&mut c, &[call(0, "p1", "phone_remind", &json!({"at": at, "text": "Call mum"}).to_string()), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("where am i") {
+                return sse(&mut c, &[call(0, "p2", "phone_location", "{}"), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && (last["name"] == "phone_remind" || last["name"] == "phone_location") {
+                return sse(&mut c, &[text("Done."), finish("stop")], Duration::ZERO);
             }
             if last["role"] == "user" && user.contains("every morning") {
                 return sse(&mut c, &[call(0, "r1", "schedule_routine", r#"{"name": "Morning news", "task": "Give me the news (plain).", "kind": "daily", "time": "08:00"}"#), finish("tool_calls")], Duration::ZERO);
@@ -160,6 +202,83 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
         _ => {
             let _ = c.raw(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
+    }
+}
+
+/// Google's token endpoint, userinfo and the bits of Gmail the test uses. "at1" (the first access
+/// token) is refused by Gmail, so the gateway has to refresh it.
+fn fake_google(c: &mut Conn<TcpStream>, req: &cubic_gateway::http::Request, raw: &str, seen: &Mutex<Seen>) {
+    let auth = req.header("Authorization").unwrap_or("").to_string();
+    seen.lock().unwrap().google.push((format!("{} {}", req.method, req.target), auth.clone(), raw.to_string()));
+    let b64 = |s: &str| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, s);
+    let reply = match req.path() {
+        "/g/token" if raw.contains("grant_type=authorization_code") => json!({
+            "access_token": "at1", "refresh_token": "rt1", "expires_in": 3600,
+            "scope": "openid email https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive"
+        }),
+        "/g/token" if raw.contains("grant_type=refresh_token") && raw.contains("refresh_token=rt1") => json!({"access_token": "at2", "expires_in": 3600}),
+        "/g/userinfo" => json!({"email": "me@example.com"}),
+        _ if auth != "Bearer at2" => {
+            let _ = c.raw(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            return;
+        }
+        "/g/gmail/v1/users/me/messages" => json!({"messages": [{"id": "m1"}]}),
+        "/g/gmail/v1/users/me/messages/m1" if req.query("format").as_deref() == Some("full") => json!({
+            "id": "m1", "threadId": "t1",
+            "payload": {"mimeType": "multipart/alternative", "headers": [{"name": "From", "value": "Bob <bob@example.com>"}, {"name": "Subject", "value": "Lunch"}],
+                "parts": [{"mimeType": "text/plain", "body": {"data": b64("Lunch at noon?")}}, {"mimeType": "text/html", "body": {"data": b64("<p>Lunch at noon?</p>")}}]}
+        }),
+        "/g/gmail/v1/users/me/messages/m1" => json!({
+            "id": "m1", "threadId": "t1", "labelIds": ["UNREAD", "INBOX"], "snippet": "Lunch at noon?",
+            "payload": {"headers": [{"name": "From", "value": "Bob <bob@example.com>"}, {"name": "Subject", "value": "Lunch"}, {"name": "Date", "value": "Mon, 9 Nov 2026 10:00"}, {"name": "Message-ID", "value": "<m1@mail>"}]}
+        }),
+        "/g/gmail/v1/users/me/messages/send" => json!({"id": "s1"}),
+        _ => {
+            let _ = c.raw(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            return;
+        }
+    };
+    json_reply(c, &reply);
+}
+
+/// A remote MCP server (Streamable HTTP): a session id from initialize, a token on every call, and
+/// tool results as server-sent events after a progress notification.
+fn fake_mcp(c: &mut Conn<TcpStream>, req: &cubic_gateway::http::Request, body: &Value, seen: &Mutex<Seen>) {
+    let method = body["method"].as_str().unwrap_or("").to_string();
+    let sid = req.header("Mcp-Session-Id").unwrap_or("").to_string();
+    let auth = req.header("Authorization").unwrap_or("").to_string();
+    seen.lock().unwrap().mcp.push((method.clone(), sid.clone(), auth.clone()));
+    let send = |c: &mut Conn<TcpStream>, extra: &str, v: Value| {
+        let b = v.to_string();
+        let _ = c.raw(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len()).as_bytes());
+    };
+    if auth != "Bearer mcp-secret" {
+        let _ = c.raw(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    let id = body["id"].clone();
+    match method.as_str() {
+        "initialize" => send(c, "Mcp-Session-Id: sess-1\r\n", json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake"}}})),
+        "notifications/initialized" => {
+            let _ = c.raw(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+        _ if sid != "sess-1" => {
+            let _ = c.raw(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+        "tools/list" => send(c, "", json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
+            {"name": "get_issue", "description": "Read an issue.", "inputSchema": {"$schema": "x", "type": "object", "properties": {"number": {"type": "integer"}}, "additionalProperties": false}, "annotations": {"readOnlyHint": true}},
+            {"name": "create_issue", "description": "Open an issue.", "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}}
+        ]}})),
+        "tools/call" => {
+            let text = match body["params"]["name"].as_str() {
+                Some("get_issue") => format!("Issue {}: Login is broken", body["params"]["arguments"]["number"]),
+                _ => format!("Created issue 8: {}", body["params"]["arguments"]["title"].as_str().unwrap_or("")),
+            };
+            let _ = c.raw(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let _ = c.raw(format!("data: {}\n\n", json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1}})).as_bytes());
+            let _ = c.raw(format!("event: message\ndata: {}\n\n", json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}]}})).as_bytes());
+        }
+        _ => send(c, "", json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no"}})),
     }
 }
 
@@ -232,7 +351,7 @@ fn setup_with(name: &str, computer: bool) -> Setup {
     let _ = std::fs::remove_dir_all(&dir);
     let (url, seen) = fake();
     let computer = computer.then(|| bots::computer::Setup { dir: dir.join("computer"), docker: fake_docker(&dir), name: "fake".into(), image: "fake".into() });
-    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer };
+    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer, google: Some(format!("{url}/g")) };
     let config = Config { dir: dir.join("config"), ollama: url.clone(), searxng: url.clone(), default_ctx: 16384, media: None, voice: None, bots: Some(paths) };
     let id = identity::load(&config.dir).unwrap();
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
@@ -347,7 +466,7 @@ fn a_cloud_bot_searches_writes_and_remembers() {
     assert!(seen.auth.iter().all(|a| a == "Bearer sk-test"));
     let first = &seen.cloud[0];
     assert_eq!(first["model"], "test-model");
-    assert_eq!(first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(), ["web_search", "read_page", "list_files", "read_file", "write_file", "remember", "forget", "schedule_routine", "cancel_routine"]);
+    assert_eq!(first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(), ["web_search", "read_page", "list_files", "read_file", "write_file", "remember", "forget", "schedule_routine", "cancel_routine", "phone_remind", "phone_notify", "phone_copy", "phone_open", "phone_location", "phone_status"]);
     let system = first["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("You are Reporter,") && system.contains("Your job:\nKeep notes on CubicAI.") && system.contains("(nothing yet)"), "{system}");
     let third = seen.cloud[2]["messages"].as_array().unwrap();
@@ -723,7 +842,7 @@ fn the_conversation_starts_at_the_user_and_cuts_old_results() {
 fn net_real_bot() {
     let dir = std::env::temp_dir().join(format!("cubic-gw-realbot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer: None };
+    let paths = bots::Paths { bots: dir.join("bots"), workspace: dir.join("workspace"), computer: None, google: None };
     let config = Config { media: None, bots: Some(paths), ..Config::from_env() };
     let id = identity::load(&config.dir).expect("this PC's gateway identity");
     let gw = server::start(config, &id, "127.0.0.1", 0, false).expect("gateway starts");
@@ -763,7 +882,7 @@ fn net_real_computer() {
     let dir = std::env::temp_dir().join(format!("cubic-computer-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("ws")).unwrap();
-    let setup = Setup { dir: dir.join("c"), docker: "docker".into(), name: "cubicai-computer-test".into(), image: "cubicai-computer:1".into() };
+    let setup = Setup { dir: dir.join("c"), docker: "docker".into(), name: "cubicai-computer-test".into(), image: bots::computer::IMAGE.into() };
     let c = Computer::new(&setup, &dir.join("ws"));
     c.clean_start();
     let no = AtomicBool::new(false);
@@ -819,4 +938,205 @@ fn net_real_computer() {
 unsafe extern "C" {
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
+}
+
+#[test]
+fn google_signs_in_reads_mail_and_asks_before_sending() {
+    let s = setup("google");
+    s.custom_keys();
+    // Not connected: Bots get no Google tools, and the sign-in needs the client first.
+    assert_eq!(s.ask("GET", "/v1/google", None).json(), json!({"connected": false, "client": false}));
+    assert_eq!(s.ask("POST", "/v1/google/start", Some(json!({"redirect": "http://127.0.0.1:5555"}))).status, 400);
+    assert_eq!(s.ask("PUT", "/v1/google", Some(json!({"web": {"client_id": "x", "client_secret": "y"}}))).status, 400, "a web client is refused");
+    assert_eq!(s.ask("PUT", "/v1/google", Some(json!({"client_id": "cid.apps.googleusercontent.com", "client_secret": "csecret"}))).status, 200);
+    assert_eq!(s.ask("POST", "/v1/google/start", Some(json!({"redirect": "https://evil.example/cb"}))).status, 400, "only loopback redirects");
+
+    // Sign in: the phone opens the URL, Google sends the code back to its loopback, the phone passes it on.
+    let r = s.ask("POST", "/v1/google/start", Some(json!({"redirect": "http://127.0.0.1:5555"}))).json();
+    let url = r["url"].as_str().unwrap().to_string();
+    let q = bots::google::query(&url);
+    assert!(url.starts_with(&format!("{}/g/auth?", s.url)), "{url}");
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["access_type"], "offline");
+    assert!(q["scope"].contains("gmail.modify") && q["scope"].contains("auth/drive"));
+    assert_eq!(s.ask("POST", "/v1/google/finish", Some(json!({"code": "c1", "state": "wrong"}))).status, 400);
+    let done = s.ask("POST", "/v1/google/finish", Some(json!({"code": "c1", "state": q["state"]})));
+    assert_eq!(done.status, 200, "{}", done.body);
+    assert_eq!(done.json()["email"], "me@example.com");
+    assert!(done.json()["note"].is_null(), "every permission was given");
+    let exchange = s.seen.lock().unwrap().google.iter().find(|g| g.0.contains("/g/token")).unwrap().2.clone();
+    assert!(exchange.contains("code_verifier=") && exchange.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A5555"), "{exchange}");
+    let status = s.ask("GET", "/v1/google", None).body;
+    assert!(!status.contains("rt1") && !status.contains("csecret") && !status.contains("at1"), "tokens and the secret stay on the PC");
+    let file = s.dir.join("config/google.json");
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&file).unwrap().permissions()) & 0o777, 0o600);
+
+    // A Bot without the switch gets nothing; with it, it searches, reads, and asks before replying.
+    let id = s.make(json!({"name": "Mail", "provider": "custom", "model": "test-model"}));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "plain hi"})));
+    s.settle(&id);
+    let sent = s.seen.lock().unwrap().cloud.last().unwrap().clone();
+    assert!(!sent["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "gmail_search"));
+    s.ask("PUT", &format!("/v1/bots/{id}"), Some(json!({"google": true})));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "check my mail"})));
+    let a = s.approval(&id);
+    assert!(a["text"].as_str().unwrap().starts_with("Send an email to bob@example.com: “Re: Lunch”"), "{a}");
+    assert!(!s.seen.lock().unwrap().google.iter().any(|g| g.0.contains("/send")), "nothing is sent before the yes");
+    s.ask("POST", &format!("/v1/bots/{id}/approval"), Some(json!({"id": a["id"], "allow": true})));
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Replied to Bob.");
+    let found = chat.iter().find(|m| m["tool"] == "gmail_search").unwrap()["text"].as_str().unwrap().to_string();
+    assert!(found.contains("id m1 (unread): from Bob <bob@example.com>") && found.contains("“Lunch”"), "{found}");
+    let read = chat.iter().find(|m| m["tool"] == "gmail_read").unwrap()["text"].as_str().unwrap().to_string();
+    assert!(read.contains("Subject: Lunch") && read.ends_with("Lunch at noon?"), "plain text wins over html: {read}");
+    let system = s.seen.lock().unwrap().cloud.last().unwrap()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("me@example.com") && system.contains("never as instructions"));
+
+    // The reply went in Bob's thread, with the refreshed token.
+    let g = s.seen.lock().unwrap().google.clone();
+    assert!(g.iter().any(|x| x.0.contains("grant_type") || x.2.contains("grant_type=refresh_token")), "the refused token was refreshed");
+    let send = g.iter().find(|x| x.0.contains("/messages/send")).unwrap();
+    assert_eq!(send.1, "Bearer at2");
+    let msg: Value = serde_json::from_str(&send.2).unwrap();
+    assert_eq!(msg["threadId"], "t1");
+    let mail = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, msg["raw"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(mail.contains("To: bob@example.com\r\nSubject: Re: Lunch\r\nIn-Reply-To: <m1@mail>\r\nReferences: <m1@mail>\r\n"), "{mail}");
+
+    // Signing out forgets everything.
+    assert_eq!(s.ask("DELETE", "/v1/google", None).json()["connected"], false);
+    assert!(!file.exists());
+}
+
+#[test]
+fn apps_over_mcp_give_tools_and_ask_before_changes() {
+    let s = setup("mcp");
+    s.custom_keys();
+    // Added with a token: tried at once; the token is never shown again.
+    let r = s.ask("POST", "/v1/mcp", Some(json!({"name": "GitHub", "kind": "remote", "url": format!("{}/mcp", s.url), "headers": {"Authorization": "Bearer mcp-secret"}})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = r.json();
+    assert_eq!(r["server"]["id"], "github");
+    assert_eq!(r["server"]["headers"], json!(["Authorization"]));
+    assert_eq!(r["tools"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["tools"][0]["read_only"], true);
+    assert!(!s.ask("GET", "/v1/mcp", None).body.contains("mcp-secret"));
+    let file = s.dir.join("config/mcp.json");
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&file).unwrap().permissions()) & 0o777, 0o600);
+    assert_eq!(s.ask("POST", "/v1/mcp", Some(json!({"name": "Bad", "kind": "remote", "url": "ftp://x"}))).status, 400);
+
+    // A wrong token is said plainly.
+    let bad = s.ask("POST", "/v1/mcp", Some(json!({"name": "Nope", "kind": "remote", "url": format!("{}/mcp", s.url), "headers": {"Authorization": "Bearer wrong"}}))).json();
+    assert!(bad["error"].as_str().unwrap().contains("refused CubicAI's sign-in"), "{bad}");
+    s.ask("DELETE", "/v1/mcp/nope", None);
+
+    // A Bot given the app: its tools are offered (schema cleaned), the read-only one runs, the other asks.
+    let id = s.make(json!({"name": "Dev", "provider": "custom", "model": "test-model"}));
+    s.ask("PUT", &format!("/v1/bots/{id}"), Some(json!({"mcp": ["github"]})));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "file the bug"})));
+    let a = s.approval(&id);
+    assert!(a["text"].as_str().unwrap().starts_with("Use GitHub: create_issue {\"title\":\"Login broken again\"}"), "{a}");
+    s.ask("POST", &format!("/v1/bots/{id}/approval"), Some(json!({"id": a["id"], "allow": true})));
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Filed it.");
+    assert_eq!(chat.iter().find(|m| m["tool"] == "github__get_issue").unwrap()["text"], "Issue 7: Login is broken");
+    assert_eq!(chat.iter().find(|m| m["tool"] == "github__create_issue").unwrap()["text"], "Created issue 8: Login broken again");
+    let sent = s.seen.lock().unwrap().cloud.iter().rev().find(|b| b["messages"][0]["content"].as_str().unwrap_or("").contains("apps you can use")).unwrap().clone();
+    let get = sent["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "github__get_issue").unwrap().clone();
+    assert_eq!(get["function"]["description"], "[GitHub] Read an issue.");
+    assert_eq!(get["function"]["parameters"], json!({"type": "object", "properties": {"number": {"type": "integer"}}}));
+    // One session, reused, and every call carried the token.
+    let calls = s.seen.lock().unwrap().mcp.clone();
+    assert!(calls.iter().filter(|c| c.0 == "tools/call").all(|c| c.1 == "sess-1" && c.2 == "Bearer mcp-secret"), "{calls:?}");
+
+    // Set to ask never: no question.
+    s.ask("PUT", "/v1/mcp/github", Some(json!({"ask": "never"})));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "file the bug"})));
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Filed it.");
+
+    // Unreachable: the Bot is told, and still works.
+    s.ask("PUT", "/v1/mcp/github", Some(json!({"url": "http://127.0.0.1:9/mcp"})));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "plain hi"})));
+    s.settle(&id);
+    let sys = s.seen.lock().unwrap().cloud.last().unwrap()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(sys.contains("can't be reached right now: GitHub"), "{sys}");
+}
+
+#[test]
+fn a_local_app_runs_inside_the_computer() {
+    let s = setup_with("mcp-local", true);
+    let script = s.dir.join("echo_mcp.py");
+    std::fs::write(&script, r#"
+import sys, json
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m or "method" not in m:
+        continue
+    if m["method"] == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": "p1", "method": "ping"}), flush=True)
+        r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "echo"}}
+    elif m["method"] == "tools/list":
+        r = {"tools": [{"name": "echo", "description": "Says it back.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}, "annotations": {"readOnlyHint": True}}]}
+    else:
+        r = {}
+    print("not json, a log line", flush=True)
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
+"#).unwrap();
+    let r = s.ask("POST", "/v1/mcp", Some(json!({"name": "Echo", "kind": "sandbox", "command": format!("python3 {}", script.display()), "env": {"TOKEN": "t"}})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = r.json();
+    assert_eq!(r["server"]["env"], json!(["TOKEN"]));
+    assert_eq!(r["tools"][0]["name"], "echo", "{r}");
+    // Asked again: the same process answers.
+    assert_eq!(s.ask("GET", "/v1/mcp/echo/tools", None).json()["tools"][0]["description"], "Says it back.");
+    assert_eq!(s.ask("DELETE", "/v1/mcp/echo", None).status, 200);
+    assert_eq!(s.ask("GET", "/v1/mcp/echo/tools", None).status, 404);
+}
+
+#[test]
+fn the_phone_gets_reminders_and_answers_questions() {
+    let s = setup("phone");
+    s.custom_keys();
+    let id = s.make(json!({"name": "Helper", "provider": "custom", "model": "test-model"}));
+
+    // A reminder goes to the feed (the phone reads it even with the app closed), at the local time asked.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "remind me to call mum tomorrow at 18:30"})));
+    let chat = s.settle(&id);
+    let step = chat.iter().find(|m| m["tool"] == "phone_remind").unwrap();
+    assert!(step["text"].as_str().unwrap().starts_with("Sent to the phone"), "{}", step["text"]);
+    let feed = s.ask("GET", "/v1/bots/feed?after=0", None).json()["items"].as_array().unwrap().clone();
+    let item = feed.iter().find(|f| f["kind"] == "phone").expect("a phone item");
+    assert_eq!(item["phone"]["do"], "remind");
+    assert_eq!(item["phone"]["text"], "Call mum");
+    assert!(feed.iter().filter(|f| f["kind"] == "reply").all(|f| f["quiet"] == true), "the reply after a reminder notifies nothing more");
+    let at = item["phone"]["at"].as_i64().unwrap() / 1000;
+    let t = cubic_gateway::time::local(at);
+    assert_eq!((t.hour, t.minute), (18, 30));
+    assert!((at - cubic_gateway::time::now() as i64 - 86400).abs() < 86400);
+
+    // A question waits for the phone's answer (it's in /messages for a phone that opens the chat).
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "where am i?"})));
+    let end = Instant::now() + Duration::from_secs(10);
+    let q = loop {
+        let r = s.ask("GET", &format!("/v1/bots/{id}/messages"), None).json();
+        if r["phone"].is_object() {
+            break r["phone"].clone();
+        }
+        assert!(Instant::now() < end, "never asked the phone");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(q["do"], "location");
+    assert_eq!(s.ask("POST", &format!("/v1/bots/{id}/phone"), Some(json!({"id": "nope", "answer": {}}))).status, 404);
+    let r = s.ask("POST", &format!("/v1/bots/{id}/phone"), Some(json!({"id": q["id"], "answer": {"lat": 12.97194, "lon": 77.59369, "accuracy": 25.0, "place": "MG Road, Bengaluru"}})));
+    assert_eq!(r.status, 200);
+    let chat = s.settle(&id);
+    let got = chat.iter().find(|m| m["tool"] == "phone_location").unwrap()["text"].as_str().unwrap().to_string();
+    assert!(got.starts_with("The phone is at 12.97194, 77.59369 (within about 25 m). That's MG Road, Bengaluru. Map: https://www.openstreetmap.org/"), "{got}");
+
+    // Switched off: no phone tools.
+    s.ask("PUT", &format!("/v1/bots/{id}"), Some(json!({"phone": false})));
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "plain hi"})));
+    s.settle(&id);
+    let sent = s.seen.lock().unwrap().cloud.last().unwrap().clone();
+    assert!(!sent["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "phone_remind"));
 }

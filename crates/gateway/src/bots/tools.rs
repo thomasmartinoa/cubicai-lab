@@ -14,6 +14,14 @@ pub const ROUTINE_TOOLS: [&str; 2] = ["schedule_routine", "cancel_routine"];
 /// Tools for the Bots' computer (computer.rs), offered when a Bot has one.
 pub const COMPUTER_TOOLS: [&str; 6] = ["run_command", "browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back"];
 
+/// The user's Google account (google.rs), offered when it's connected and the Bot may use it.
+pub const GOOGLE_TOOLS: [&str; 12] = [
+    "gmail_search", "gmail_read", "gmail_send", "gmail_draft", "calendar_events", "calendar_create", "calendar_update", "calendar_delete", "drive_search", "drive_read", "drive_download", "drive_create",
+];
+
+/// The user's phone, offered unless the user switched it off for the Bot.
+pub const PHONE_TOOLS: [&str; 6] = ["phone_remind", "phone_notify", "phone_copy", "phone_open", "phone_location", "phone_status"];
+
 pub struct Ctx<'a> {
     pub searxng: &'a str,
     pub workspace: &'a Path,
@@ -39,12 +47,47 @@ fn function(name: &str, description: &str, properties: Value, required: &[&str])
 }
 
 /// The tools, in OpenAI's function format (with the computer's when the Bot has one).
-pub fn definitions(computer: bool) -> Value {
+pub fn definitions(computer: bool, google: bool) -> Value {
     let mut all = base_definitions();
     if computer {
         all.as_array_mut().unwrap().extend(computer_definitions().as_array().unwrap().iter().cloned());
     }
+    if google {
+        all.as_array_mut().unwrap().extend(google_definitions().as_array().unwrap().iter().cloned());
+    }
     all
+}
+
+pub fn phone_definitions() -> Value {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    json!([
+        function("phone_remind", "Set a reminder on the user's phone: it rings at that time with your text.", json!({"at": s("When, in the user's local time, like 2026-11-10T18:00."), "text": s("What to remind them of, in a few words.")}), &["at", "text"]),
+        function("phone_notify", "Send a notification to the user's phone now (for something they should see soon).", json!({"text": s("What it says."), "url": s("Optional link to open when tapped.")}), &["text"]),
+        function("phone_copy", "Put text on the user's phone clipboard (a code, an address, a message to paste).", json!({"text": s("The text.")}), &["text"]),
+        function("phone_open", "Open a web page on the user's phone.", json!({"url": s("The address."), "why": s("Optional: a few words on what it is.")}), &["url"]),
+        function("phone_location", "Ask the user's phone where it is (only answered while the app is open on it).", json!({}), &[]),
+        function("phone_status", "Ask the user's phone for its battery, charging, network and time zone (only answered while the app is open on it).", json!({}), &[]),
+    ])
+}
+
+fn google_definitions() -> Value {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let max = json!({"type": "integer", "description": "How many (default 10, at most 25)."});
+    let when = "Local time like 2026-11-10T09:00, or 2026-11-10 for an all-day event.";
+    json!([
+        function("gmail_search", "Search the user's Gmail (Gmail search syntax: from:, to:, subject:, is:unread, newer_than:2d, has:attachment …). Gives ids, senders, subjects and snippets.", json!({"query": s("Gmail search, e.g. \"is:unread newer_than:1d\"."), "max": max}), &["query"]),
+        function("gmail_read", "Read one email in full, by the id gmail_search gave.", json!({"id": s("The email's id.")}), &["id"]),
+        function("gmail_send", "Send an email from the user's Gmail (the user is asked first). To reply, give reply_to_id: it goes in the same thread.", json!({"to": s("Address(es), comma-separated."), "cc": s("Optional."), "subject": s("Subject (a reply can leave it out)."), "body": s("Plain text."), "reply_to_id": s("Optional: the id of the email this answers.")}), &["to", "body"]),
+        function("gmail_draft", "Save an email as a draft in the user's Gmail without sending it.", json!({"to": s("Address(es), comma-separated."), "cc": s("Optional."), "subject": s("Subject."), "body": s("Plain text."), "reply_to_id": s("Optional: the id of the email this answers.")}), &["to", "body"]),
+        function("calendar_events", "List events in the user's Google Calendar between two times (default: the next 7 days), optionally matching words.", json!({"from": s(when), "to": s(when), "query": s("Optional words to match."), "max": max}), &[]),
+        function("calendar_create", "Add an event to the user's Google Calendar (the user is asked first).", json!({"title": s("What it is."), "start": s(when), "end": s(when), "location": s("Optional."), "description": s("Optional."), "attendees": s("Optional addresses to invite, comma-separated (they get an email).")}), &["title", "start", "end"]),
+        function("calendar_update", "Change an event (only the fields given; the user is asked first).", json!({"id": s("The event's id from calendar_events."), "title": s("Optional."), "start": s(when), "end": s(when), "location": s("Optional."), "description": s("Optional.")}), &["id"]),
+        function("calendar_delete", "Delete an event (the user is asked first).", json!({"id": s("The event's id from calendar_events.")}), &["id"]),
+        function("drive_search", "Search the user's Google Drive by name and content.", json!({"query": s("Words to find."), "max": max}), &["query"]),
+        function("drive_read", "Read a Drive file as text (Google Docs as text, Sheets as CSV, text files as they are).", json!({"id": s("The file's id from drive_search.")}), &["id"]),
+        function("drive_download", "Copy a Drive file into your workspace (Docs as .docx, Sheets as .xlsx, Slides as .pdf), to work on it there.", json!({"id": s("The file's id."), "path": s("Optional workspace path; default drive/<name>.")}), &["id"]),
+        function("drive_create", "Create a new file in the user's Google Drive (a Google Doc by default; the user is asked first). Or upload a workspace file with path.", json!({"name": s("The file's name."), "content": s("Its text (for a new Doc or text file)."), "path": s("Optional: a workspace file to upload instead."), "google_doc": {"type": "boolean", "description": "Make it a Google Doc (default true; ignored for uploads)."}}), &["name"]),
+    ])
 }
 
 fn computer_definitions() -> Value {

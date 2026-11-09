@@ -74,3 +74,27 @@ pub fn local_epoch(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i
     tm.tm_isdst = -1;
     unsafe { libc::mktime(&mut tm) as i64 }
 }
+
+/// This PC's offset from UTC at that moment, in seconds (east positive), e.g. 19800 for India.
+pub fn offset(secs: i64) -> i64 {
+    // SAFETY: localtime_r only writes the tm we hand it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t: libc::time_t = secs as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    tm.tm_gmtoff
+}
+
+/// A local "2026-11-10T09:00" (or with seconds) as RFC 3339 with this PC's offset: "2026-11-10T09:00:00+05:30".
+pub fn rfc3339_local(s: &str) -> Option<String> {
+    let s = s.trim().replace(' ', "T");
+    let (date, time) = s.split_once('T')?;
+    let d: Vec<u32> = date.split('-').filter_map(|p| p.parse().ok()).collect();
+    let t: Vec<u32> = time.split(':').filter_map(|p| p.parse().ok()).collect();
+    if d.len() != 3 || t.len() < 2 || d[1] == 0 || d[1] > 12 || d[2] == 0 || d[2] > 31 || t[0] > 23 || t[1] > 59 {
+        return None;
+    }
+    let epoch = local_epoch(d[0] as i32, d[1], d[2], t[0], t[1]);
+    let off = offset(epoch);
+    let sign = if off < 0 { '-' } else { '+' };
+    Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}", d[0], d[1], d[2], t[0], t[1], t.get(2).copied().unwrap_or(0).min(59), off.abs() / 3600, off.abs() % 3600 / 60))
+}

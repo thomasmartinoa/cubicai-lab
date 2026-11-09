@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub const IMAGE: &str = "cubicai-computer:1";
+pub const IMAGE: &str = "cubicai-computer:2";
 pub const NAME: &str = "cubicai-computer";
 /// Stopped after this long without a command.
 pub const IDLE: Duration = Duration::from_secs(600);
@@ -222,6 +222,25 @@ impl Computer {
         let raw = reader.join().unwrap_or_default();
         *self.last_used.lock().unwrap() = Instant::now();
         Ok(Ran { output: trim_output(&String::from_utf8_lossy(&raw)), code, timed_out, stopped, secs: started.elapsed().as_secs_f64() })
+    }
+
+    /// Starts a long-running program in /workspace with its stdin and stdout piped (an MCP server).
+    /// It ends when the computer is removed; `touch` keeps the computer from going idle meanwhile.
+    pub fn spawn(&self, command: &str, env: &[(String, String)]) -> Result<std::process::Child, String> {
+        self.ensure()?;
+        let mut c = Command::new(&self.docker);
+        c.args(["exec", "-i", "-w", "/workspace"]);
+        for (k, v) in env {
+            c.args(["-e", &format!("{k}={v}")]);
+        }
+        c.args([&self.name, "setsid", "-w", "bash", "-c", &format!("exec {command}"), &format!("cubic-mcp-{}", super::new_id())]);
+        c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        c.spawn().map_err(|e| format!("Couldn't run docker: {e}"))
+    }
+
+    /// Marks the computer as in use (so it isn't stopped as idle).
+    pub fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
     }
 
     /// One browser command (see computer/browserd.py); the page as JSON.
