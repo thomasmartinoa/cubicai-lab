@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub const IMAGE: &str = "cubicai-computer:2";
+pub const IMAGE: &str = "cubicai-computer:3";
 pub const NAME: &str = "cubicai-computer";
 /// Stopped after this long without a command.
 pub const IDLE: Duration = Duration::from_secs(600);

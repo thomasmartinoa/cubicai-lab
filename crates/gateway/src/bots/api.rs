@@ -19,6 +19,19 @@
 //! POST   /v1/bots/<id>/approval          {id, allow}: the user's answer to an action the Bot waits on
 //! POST   /v1/bots/<id>/phone             {id, answer}: the phone's answer to a question (location, status)
 //! GET    /v1/bots/<id>/shots/<msg id>    a browser screenshot (JPEG) from a tool step
+//! POST   /v1/bots/<id>/teach             {do: start|look|open|tap|text|key|scroll|back, …}: teaching it a
+//!                                        task in the computer's browser → {url, title, steps, shot}
+//! GET    /v1/bots/<id>/teach/shot        the browser as it is now in that session (JPEG)
+//! POST   /v1/bots/<id>/teach/done        {what}: the steps go to the Bot, which writes a skill
+//! DELETE /v1/bots/<id>/teach             end the session, dropping the steps
+//! GET    /v1/groups                      group chats, each with whether it's working and its last message
+//! POST   /v1/groups                      {name, members: [bot ids]} (2–6 Bots)
+//! GET|PUT|DELETE /v1/groups/<id>         one group; change its name or members; delete it and its chat
+//! …      /v1/groups/<id>/messages|events|run|approval|phone   as for a Bot (replies carry `bot`)
+//! GET    /v1/skills                      the skills (with Bots' proposals waiting for approval)
+//! POST   /v1/skills                      {name, about, steps}: the user's own (approved at once)
+//! PUT    /v1/skills/<id>                 change it, or {approved: true} for a proposal
+//! DELETE /v1/skills/<id>                 delete it, or decline a proposal
 //! GET    /v1/bots/feed?after=MS          run ends and approvals since MS (the phone's notifications)
 //! GET    /v1/google                      {connected, email} or {connected: false, client: bool}
 //! PUT    /v1/google                      {client_id, client_secret}: the user's Google Cloud client
@@ -46,7 +59,7 @@ use std::time::Duration;
 const MAX_BOT_BODY: usize = 1024 * 1024;
 
 pub fn handles(path: &str) -> bool {
-    path == "/v1/keys" || path == "/v1/bots" || path.starts_with("/v1/bots/") || path == "/v1/google" || path.starts_with("/v1/google/") || path == "/v1/mcp" || path.starts_with("/v1/mcp/")
+    ["/v1/keys", "/v1/bots", "/v1/google", "/v1/mcp", "/v1/groups", "/v1/skills"].iter().any(|p| path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
 }
 
 fn body<S: Read + Write>(conn: &mut Conn<S>, req: &Request) -> Result<Value, (u16, String)> {
@@ -59,6 +72,96 @@ fn body<S: Read + Write>(conn: &mut Conn<S>, req: &Request) -> Result<Value, (u1
     }
     let raw = conn.read_body(n).map_err(|e| (400, e.to_string()))?;
     serde_json::from_slice(&raw).map_err(|_| (400, "Invalid JSON".into()))
+}
+
+fn group_summary(bots: &Bots, g: &super::groups::Group) -> Value {
+    let mut v = g.to_json();
+    let key = format!("g:{}", g.id);
+    v["running"] = bots.running(&key).into();
+    let last = bots.thread_messages(&super::Thread::Group(g.id.clone())).into_iter().rev().find(|m| m["role"] != "tool" && (m["text"].as_str().is_some_and(|t| !t.is_empty()) || m["error"].is_string()));
+    v["last"] = last.map(|m| json!({"role": m["role"], "text": m["text"], "error": m["error"], "at": m["at"], "bot": m["bot"]})).unwrap_or(Value::Null);
+    v
+}
+
+fn image<S: Read + Write + Timeouts>(conn: &mut Conn<S>, req: &Request, bytes: &[u8], cache: bool) -> io::Result<bool> {
+    let close = req.wants_close();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: {}\r\n{}\r\n",
+        bytes.len(),
+        if cache { "private, max-age=86400" } else { "no-store" },
+        if close { "Connection: close\r\n" } else { "" }
+    );
+    conn.raw(head.as_bytes())?;
+    conn.raw(bytes)?;
+    Ok(!close)
+}
+
+/// The routes a Bot's chat and a group's share (`key` is the run's: a Bot id or "g:<id>").
+#[allow(clippy::too_many_arguments)]
+fn thread_route<S: Read + Write + Timeouts>(bots: &std::sync::Arc<Bots>, conn: &mut Conn<S>, req: &Request, key: &str, sub: &str, send: &dyn Fn(&str) -> Result<Value, String>) -> Option<io::Result<bool>> {
+    let method = req.method.as_str();
+    macro_rules! read_body {
+        () => {
+            match body(conn, req) {
+                Ok(v) => v,
+                Err((code, m)) => return Some(conn.json(req, code, &error(&m))),
+            }
+        };
+    }
+    let thread = Bots::thread_of(key);
+    Some(match (method, sub) {
+        ("GET", "messages") => {
+            let run = bots.run(key);
+            let running = bots.running(key);
+            // A phone joining mid-run follows from the start of the current turn, so it sees all of
+            // the words being written now; messages before that are in the list.
+            let follow = run.as_ref().filter(|_| running).map(|r| r.resume_at());
+            // An action waiting for the user's yes, so a phone that opens the chat can answer it.
+            let approval = run.as_ref().filter(|_| running).and_then(|r| r.approval.lock().unwrap().clone()).map(|a| json!({"id": a["id"], "text": a["text"]}));
+            let phone = run.as_ref().filter(|_| running).and_then(|r| r.phone.lock().unwrap().clone()).filter(|p| p.get("answer").is_none());
+            conn.json(req, 200, &json!({"messages": bots.thread_messages(&thread), "running": running, "follow": follow, "approval": approval, "phone": phone}))
+        }
+        ("POST", "messages") => {
+            let v = read_body!();
+            match send(v["text"].as_str().unwrap_or("")) {
+                Ok(r) => conn.json(req, 200, &r),
+                Err(e) => conn.json(req, 400, &error(&e)),
+            }
+        }
+        ("DELETE", "messages") => {
+            if bots.running(key) {
+                return Some(conn.json(req, 400, &error("Stop the Bots before clearing the chat.")));
+            }
+            bots.clear(key);
+            conn.json(req, 200, &json!({"ok": true}))
+        }
+        ("GET", "events") => match bots.run(key) {
+            Some(run) => {
+                let after = req.query("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+                events(conn, &run, after);
+                Ok(false)
+            }
+            None => conn.json(req, 404, &error("The Bot isn't working on anything.")),
+        },
+        ("DELETE", "run") => conn.json(req, 200, &json!({"stopped": bots.stop(key)})),
+        ("POST", "phone") => {
+            let v = read_body!();
+            if bots.phone_answer(key, v["id"].as_str().unwrap_or(""), v["answer"].clone()) {
+                conn.json(req, 200, &json!({"ok": true}))
+            } else {
+                conn.json(req, 404, &error("That's no longer waiting for an answer."))
+            }
+        }
+        ("POST", "approval") => {
+            let v = read_body!();
+            if bots.answer(key, v["id"].as_str().unwrap_or(""), v["allow"].as_bool().unwrap_or(false)) {
+                conn.json(req, 200, &json!({"ok": true}))
+            } else {
+                conn.json(req, 404, &error("That's no longer waiting for an answer."))
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn summary(bots: &Bots, b: &super::Bot) -> Value {
@@ -182,6 +285,74 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             _ => conn.json(req, 404, &error("Not found")),
         };
     }
+    if path == "/v1/skills" || path.starts_with("/v1/skills/") {
+        let sk = &bots.skills;
+        let all = || json!({"skills": sk.all().iter().map(|s| s.to_json()).collect::<Vec<_>>()});
+        let id = path.trim_start_matches("/v1/skills").trim_start_matches('/');
+        return match (method, id) {
+            ("GET", "") => conn.json(req, 200, &all()),
+            ("POST", "") => {
+                let v = read_body!();
+                match sk.add(&v) {
+                    Ok(_) => conn.json(req, 200, &all()),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("PUT", id) if !id.is_empty() => {
+                let v = read_body!();
+                match sk.update(id, &v) {
+                    Ok(_) => conn.json(req, 200, &all()),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("DELETE", id) if !id.is_empty() => {
+                sk.delete(id);
+                conn.json(req, 200, &all())
+            }
+            _ => conn.json(req, 404, &error("Not found")),
+        };
+    }
+    if path == "/v1/groups" {
+        return match method {
+            "GET" => conn.json(req, 200, &json!({"groups": bots.groups().iter().map(|g| group_summary(bots, g)).collect::<Vec<_>>()})),
+            "POST" => {
+                let v = read_body!();
+                match bots.create_group(&v) {
+                    Ok(g) => {
+                        crate::log(&format!("group {} created ({} Bots)", g.id, g.members.len()));
+                        conn.json(req, 200, &json!({"group": group_summary(bots, &g)}))
+                    }
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            _ => conn.json(req, 404, &error("Not found")),
+        };
+    }
+    if let Some(rest) = path.strip_prefix("/v1/groups/") {
+        let (gid, sub) = rest.split_once('/').unwrap_or((rest, ""));
+        let Some(g) = bots.group(gid) else { return conn.json(req, 404, &error("No such group (it may have been deleted).")) };
+        let key = format!("g:{gid}");
+        let send = |t: &str| bots.send_group(gid, t);
+        if let Some(r) = thread_route(bots, conn, req, &key, sub, &send) {
+            return r;
+        }
+        return match (method, sub) {
+            ("GET", "") => conn.json(req, 200, &json!({"group": group_summary(bots, &g)})),
+            ("PUT", "") => {
+                let v = read_body!();
+                match bots.update_group(gid, &v) {
+                    Ok(g) => conn.json(req, 200, &json!({"group": group_summary(bots, &g)})),
+                    Err(e) => conn.json(req, 400, &error(&e)),
+                }
+            }
+            ("DELETE", "") => {
+                bots.delete_group(gid);
+                crate::log(&format!("group {gid} deleted"));
+                conn.json(req, 200, &json!({"ok": true}))
+            }
+            _ => conn.json(req, 404, &error("Not found")),
+        };
+    }
     if path == "/v1/bots/feed" {
         let after = req.query("after").and_then(|a| a.parse().ok()).unwrap_or(0);
         return match method {
@@ -211,6 +382,10 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
     let rest = path.strip_prefix("/v1/bots/").unwrap_or("");
     let (id, sub) = rest.split_once('/').unwrap_or((rest, ""));
     let Some(mut bot) = bots.get(id) else { return conn.json(req, 404, &error("No such Bot (it may have been deleted).")) };
+    let send = |t: &str| bots.send(id, t);
+    if let Some(r) = thread_route(bots, conn, req, id, sub, &send) {
+        return r;
+    }
     match (method, sub) {
         ("GET", "") => conn.json(req, 200, &json!({"bot": summary(bots, &bot), "memory": bots.memory(id)})),
         ("PUT", "") => {
@@ -233,74 +408,32 @@ pub fn route<S: Read + Write + Timeouts>(gw: &Gateway, conn: &mut Conn<S>, req: 
             crate::log(&format!("bot {id} deleted"));
             conn.json(req, 200, &json!({"ok": true}))
         }
-        ("GET", "messages") => {
-            let run = bots.run(id);
-            let running = bots.running(id);
-            // A phone joining mid-run follows from the start of the current turn, so it sees all of
-            // the words being written now; messages before that are in the list.
-            let follow = run.as_ref().filter(|_| running).map(|r| r.resume_at());
-            // An action waiting for the user's yes, so a phone that opens the chat can answer it.
-            let approval = run.as_ref().filter(|_| running).and_then(|r| r.approval.lock().unwrap().clone()).map(|a| json!({"id": a["id"], "text": a["text"]}));
-            let phone = run.as_ref().filter(|_| running).and_then(|r| r.phone.lock().unwrap().clone()).filter(|p| p.get("answer").is_none());
-            conn.json(req, 200, &json!({"messages": bots.messages(id), "running": running, "follow": follow, "approval": approval, "phone": phone}))
+        (_, sub) if method == "GET" && sub.starts_with("shots/") => {
+            let name = sub["shots/".len()..].trim_end_matches(".jpg");
+            match bots.shot(id, name) {
+                Some(bytes) => image(conn, req, &bytes, true),
+                None => conn.json(req, 404, &error("No such screenshot (it may have been cleared).")),
+            }
         }
-        ("POST", "messages") => {
+        ("POST", "teach") => {
             let v = read_body!();
-            match bots.send(id, v["text"].as_str().unwrap_or("")) {
+            match bots.teach(id, &v) {
+                Ok(st) => conn.json(req, 200, &st),
+                Err(e) => conn.json(req, 400, &error(&e)),
+            }
+        }
+        ("GET", "teach/shot") => match bots.teach_shot(id) {
+            Some(bytes) => image(conn, req, &bytes, false),
+            None => conn.json(req, 404, &error("There's no picture of the browser yet.")),
+        },
+        ("POST", "teach/done") => {
+            let v = read_body!();
+            match bots.teach_done(id, v["what"].as_str().unwrap_or("")) {
                 Ok(r) => conn.json(req, 200, &r),
                 Err(e) => conn.json(req, 400, &error(&e)),
             }
         }
-        ("DELETE", "messages") => {
-            if bots.running(id) {
-                return conn.json(req, 400, &error("Stop the Bot before clearing its chat."));
-            }
-            bots.clear(id);
-            conn.json(req, 200, &json!({"ok": true}))
-        }
-        ("GET", "events") => match bots.run(id) {
-            Some(run) => {
-                let after = req.query("after").and_then(|a| a.parse().ok()).unwrap_or(0);
-                events(conn, &run, after);
-                Ok(false)
-            }
-            None => conn.json(req, 404, &error("The Bot isn't working on anything.")),
-        },
-        ("DELETE", "run") => conn.json(req, 200, &json!({"stopped": bots.stop(id)})),
-        ("POST", "phone") => {
-            let v = read_body!();
-            if bots.phone_answer(id, v["id"].as_str().unwrap_or(""), v["answer"].clone()) {
-                conn.json(req, 200, &json!({"ok": true}))
-            } else {
-                conn.json(req, 404, &error("That's no longer waiting for an answer."))
-            }
-        }
-        ("POST", "approval") => {
-            let v = read_body!();
-            let ok = bots.answer(id, v["id"].as_str().unwrap_or(""), v["allow"].as_bool().unwrap_or(false));
-            if ok {
-                conn.json(req, 200, &json!({"ok": true}))
-            } else {
-                conn.json(req, 404, &error("That's no longer waiting for an answer."))
-            }
-        }
-        (_, sub) if method == "GET" && sub.starts_with("shots/") => {
-            let name = sub["shots/".len()..].trim_end_matches(".jpg");
-            match bots.shot(id, name) {
-                Some(bytes) => {
-                    let close = req.wants_close();
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nServer: cubicai\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: private, max-age=86400\r\n{}\r\n",
-                        bytes.len(),
-                        if close { "Connection: close\r\n" } else { "" }
-                    );
-                    conn.raw(head.as_bytes())?;
-                    conn.raw(&bytes)?;
-                    Ok(!close)
-                }
-                None => conn.json(req, 404, &error("No such screenshot (it may have been cleared).")),
-            }
-        }
+        ("DELETE", "teach") => conn.json(req, 200, &json!({"ended": bots.teach_cancel(id)})),
         ("GET", "routines") => conn.json(req, 200, &routines_json(bots, id)),
         ("POST", "routines") => {
             let v = read_body!();

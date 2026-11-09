@@ -13,15 +13,18 @@ pub mod api;
 pub mod brain;
 pub mod computer;
 pub mod google;
+pub mod groups;
 pub mod mcp;
 pub mod proxy;
 pub mod routines;
+pub mod skills;
+pub mod teach;
 pub mod tools;
 
 use crate::ollama::Ollama;
 use crate::settings::Settings;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -41,10 +44,16 @@ pub const MEMORY_CHARS: usize = 6000;
 pub const LATE_LIMIT_SECS: i64 = 6 * 3600;
 /// Routines a Bot may propose that the user hasn't answered yet.
 pub const MAX_PENDING: usize = 3;
-/// How long a run waits for the user to allow an action before giving up on it.
 /// How long a question to the phone waits for its answer.
 pub const PHONE_WAIT: Duration = Duration::from_secs(30);
+/// How long a run waits for the user to allow an action before giving up on it.
 pub const APPROVAL_WAIT: Duration = Duration::from_secs(15 * 60);
+/// How long a Bot waits for another Bot it handed a task to.
+pub const HANDOFF_WAIT: Duration = Duration::from_secs(20 * 60);
+/// Bots waiting on each other in a row (A asked B, which asked C…).
+pub const MAX_HANDOFF_CHAIN: usize = 3;
+/// Other Bots and skills named in a Bot's system prompt.
+pub const LISTED_BOTS: usize = 20;
 /// Screenshots kept per Bot (older ones go).
 pub const SHOTS_KEPT: usize = 200;
 /// Feed items kept for the phone's notifications.
@@ -270,6 +279,13 @@ pub struct Run {
     pub phone: Mutex<Option<Value>>,
     /// It sent the phone something (a notification, a reminder…): its end needs no notification too.
     phoned: AtomicBool,
+    /// Another Bot handed it the task ({bot, name}): the answer goes back to that one, not the phone.
+    pub from: Mutex<Option<Value>>,
+    /// A group's run: {id, name}, so its notifications open the group.
+    pub group: Mutex<Option<Value>>,
+    /// Who asked whom in this turn (asker id, asked id) → the answer: a Bot asks another once per turn
+    /// (gemma asked the same thing three times over), and in a group the one asked counts as heard from.
+    asked: Mutex<HashMap<(String, String), String>>,
 }
 
 impl Run {
@@ -328,6 +344,28 @@ pub struct Bots {
     pub computer: Option<computer::Computer>,
     pub google: google::Google,
     pub mcp: mcp::Mcp,
+    pub skills: skills::Skills,
+    /// The user teaching a Bot a task in the computer's browser (one at a time: there's one browser).
+    teach: Mutex<Option<teach::Teach>>,
+    /// Bot → the Bot it handed a task to and waits on (so two never wait on each other).
+    waits: Mutex<HashMap<String, String>>,
+    groups_lock: Mutex<()>,
+}
+
+/// Where a chat lives: a Bot's own, or a group's. Runs are keyed by `key()` (a group's starts "g:").
+#[derive(Clone, Debug, PartialEq)]
+pub enum Thread {
+    Bot(String),
+    Group(String),
+}
+
+impl Thread {
+    pub fn key(&self) -> String {
+        match self {
+            Thread::Bot(id) => id.clone(),
+            Thread::Group(g) => format!("g:{g}"),
+        }
+    }
 }
 
 pub fn now_ms() -> u64 {
@@ -415,6 +453,7 @@ impl Bots {
         let _ = std::fs::create_dir_all(&paths.workspace);
         let computer = paths.computer.as_ref().map(|c| computer::Computer::new(c, &paths.workspace));
         let google = google::Google::new(config_dir, paths.google.as_deref().map(google::Bases::at).unwrap_or_else(google::Bases::real));
+        let paths_bots = paths.bots.clone();
         let bots = Arc::new(Bots {
             keys: Keys::new(config_dir),
             settings: Settings::new(config_dir),
@@ -430,6 +469,10 @@ impl Bots {
             computer,
             google,
             mcp: mcp::Mcp::new(config_dir),
+            skills: skills::Skills::new(&paths_bots),
+            teach: Mutex::new(None),
+            waits: Mutex::new(HashMap::new()),
+            groups_lock: Mutex::new(()),
         });
         // The scheduler: checks the routines every 15 s while the gateway (this Bots) is alive.
         let weak: Weak<Bots> = Arc::downgrade(&bots);
@@ -493,6 +536,7 @@ impl Bots {
         if let Some(r) = self.runs.lock().unwrap().remove(id) {
             r.stop.store(true, Ordering::SeqCst);
         }
+        self.leave_groups(id);
         std::fs::remove_dir_all(d).is_ok()
     }
 
@@ -511,7 +555,18 @@ impl Bots {
     /// The whole chat, oldest first. A reply and its tool results carry the time their turn began,
     /// so a message the user sent while the Bot was writing comes after that reply, not before it.
     pub fn messages(&self, id: &str) -> Vec<Value> {
-        let Some(d) = self.dir(id) else { return vec![] };
+        self.thread_messages(&Thread::Bot(id.to_string()))
+    }
+
+    fn thread_dir(&self, t: &Thread) -> Option<PathBuf> {
+        match t {
+            Thread::Bot(id) => self.dir(id),
+            Thread::Group(g) => valid_id(g).then(|| self.paths.bots.join("groups").join(g)),
+        }
+    }
+
+    pub fn thread_messages(&self, t: &Thread) -> Vec<Value> {
+        let Some(d) = self.thread_dir(t) else { return vec![] };
         let _g = self.files.lock().unwrap();
         let mut all: Vec<Value> = std::fs::read_to_string(d.join("chat.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         all.sort_by_key(|m| m["at"].as_u64().unwrap_or(0));
@@ -519,7 +574,11 @@ impl Bots {
     }
 
     fn append(&self, id: &str, msg: &Value) {
-        let Some(d) = self.dir(id) else { return };
+        self.append_to(&Thread::Bot(id.to_string()), msg)
+    }
+
+    fn append_to(&self, t: &Thread, msg: &Value) {
+        let Some(d) = self.thread_dir(t) else { return };
         let _g = self.files.lock().unwrap();
         let file = std::fs::OpenOptions::new().create(true).append(true).open(d.join("chat.jsonl"));
         if let Ok(mut f) = file {
@@ -529,7 +588,7 @@ impl Bots {
     }
 
     pub fn clear(&self, id: &str) {
-        if let Some(d) = self.dir(id) {
+        if let Some(d) = self.thread_dir(&Self::thread_of(id)) {
             let _g = self.files.lock().unwrap();
             let _ = std::fs::remove_file(d.join("chat.jsonl"));
             let _ = std::fs::remove_dir_all(d.join("shots"));
@@ -570,26 +629,55 @@ impl Bots {
         self.start(bot, msg, None)
     }
 
+    /// A run key or a Bot id → its thread ("g:<id>" is a group's).
+    pub fn thread_of(key: &str) -> Thread {
+        match key.strip_prefix("g:") {
+            Some(g) => Thread::Group(g.to_string()),
+            None => Thread::Bot(key.to_string()),
+        }
+    }
+
     /// Stores a user (or routine) message and hands it to the running Bot, or starts a run.
     fn start(self: &Arc<Bots>, bot: Bot, msg: Value, routine: Option<Value>) -> Result<Value, String> {
-        let id = bot.id.clone();
-        let id = id.as_str();
-        self.append(id, &msg);
+        Ok(self.launch(Thread::Bot(bot.id.clone()), msg, |run| *run.routine.lock().unwrap() = routine).0)
+    }
+
+    /// Stores a message in a thread and hands it to the run under way there, or starts one (`setup`
+    /// prepares a new run). Gives {message, queued} and the run.
+    fn launch(self: &Arc<Bots>, thread: Thread, msg: Value, setup: impl FnOnce(&Run)) -> (Value, Arc<Run>) {
+        let key = thread.key();
+        self.append_to(&thread, &msg);
         let mut runs = self.runs.lock().unwrap();
-        if let Some(r) = runs.get(id).filter(|r| !r.done.load(Ordering::SeqCst)) {
+        if let Some(r) = runs.get(&key).filter(|r| !r.done.load(Ordering::SeqCst)) {
             r.inbox.lock().unwrap().push(msg.clone());
             r.push(json!({"type": "message", "message": msg}));
-            return Ok(json!({"message": msg, "queued": true}));
+            return (json!({"message": msg, "queued": true}), r.clone());
         }
         let run = Arc::new(Run::default());
-        *run.routine.lock().unwrap() = routine;
+        setup(&run);
         run.push(json!({"type": "start"}));
         run.push(json!({"type": "message", "message": msg}));
-        runs.insert(id.to_string(), run.clone());
+        runs.insert(key, run.clone());
         drop(runs);
         let me = self.clone();
-        std::thread::spawn(move || me.work(bot, run));
-        Ok(json!({"message": msg, "queued": false}))
+        let r = run.clone();
+        match thread {
+            Thread::Bot(id) => match self.get(&id) {
+                Some(bot) => {
+                    std::thread::spawn(move || me.work(bot, r));
+                }
+                None => {
+                    run.done.store(true, Ordering::SeqCst);
+                    run.push(json!({"type": "done", "error": "No such Bot.", "stopped": false}));
+                }
+            },
+            Thread::Group(g) => {
+                *run.group.lock().unwrap() = self.group(&g).map(|x| json!({"id": x.id, "name": x.name}));
+                let first = msg["at"].as_u64().unwrap_or(0);
+                std::thread::spawn(move || me.work_group(g, r, first));
+            }
+        }
+        (json!({"message": msg, "queued": false}), run)
     }
 
     pub fn routines(&self, id: &str) -> Vec<routines::Routine> {
@@ -702,15 +790,19 @@ impl Bots {
     }
 
     fn push_feed(&self, bot: &Bot, kind: &str, text: &str, routine: Option<&routines::Routine>, quiet: bool) {
-        self.push_feed_with(bot, kind, text, routine, quiet, None)
+        self.push_feed_with(bot, kind, text, routine, quiet, None, None)
     }
 
-    fn push_feed_with(&self, bot: &Bot, kind: &str, text: &str, routine: Option<&routines::Routine>, quiet: bool, phone: Option<&Value>) {
+    #[allow(clippy::too_many_arguments)]
+    fn push_feed_with(&self, bot: &Bot, kind: &str, text: &str, routine: Option<&routines::Routine>, quiet: bool, phone: Option<&Value>, group: Option<&Value>) {
         let preview: String = text.trim().chars().take(300).collect();
         let _g = self.feed_lock.lock().unwrap();
         let mut item = json!({"id": new_id(), "at": now_ms(), "kind": kind, "bot": bot.id, "name": bot.name, "color": bot.color, "text": preview, "quiet": quiet});
         if let Some(p) = phone {
             item["phone"] = p.clone();
+        }
+        if let Some(g) = group {
+            item["group"] = g.clone();
         }
         if let Some(r) = routine {
             item["routine"] = json!({"id": r.id, "name": r.name});
@@ -733,7 +825,10 @@ impl Bots {
                 let last = self.messages(&bot.id).into_iter().rev().find(|m| m["role"] == "assistant" && m["at"].as_u64().unwrap_or(0) >= started_ms && m["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
                 let text = last.as_ref().and_then(|m| m["text"].as_str()).unwrap_or("").to_string();
                 // A routine with nothing to say stays in the chat without a notification.
-                let quiet = (routine.is_some() && text.trim().to_lowercase().trim_start_matches(['*', '_']).starts_with("nothing new")) || run.phoned.load(Ordering::SeqCst);
+                // So does a task another Bot handed over: its answer went back to that Bot.
+                let quiet = (routine.is_some() && text.trim().to_lowercase().trim_start_matches(['*', '_']).starts_with("nothing new"))
+                    || run.phoned.load(Ordering::SeqCst)
+                    || run.from.lock().unwrap().is_some();
                 self.push_feed(bot, if routine.is_some() { "routine" } else { "reply" }, &text, r.as_ref(), quiet);
             }
         }
@@ -766,7 +861,9 @@ impl Bots {
         run.push(json!({"type": "approval", "id": id, "text": what}));
         let mut first = what.chars();
         let lower: String = first.next().map(|c| c.to_lowercase().chain(first).collect()).unwrap_or_default();
-        self.push_feed(bot, "approval", &format!("wants to {lower}. Allow it in the Bot's chat."), None, false);
+        let group = run.group.lock().unwrap().clone();
+        let place = if group.is_some() { "the group's chat" } else { "the Bot's chat" };
+        self.push_feed_with(bot, "approval", &format!("wants to {lower}. Allow it in {place}."), None, false, None, group.as_ref());
         let end = std::time::Instant::now() + APPROVAL_WAIT;
         let mut a = run.approval.lock().unwrap();
         let answer = loop {
@@ -832,7 +929,7 @@ impl Bots {
         let id = new_id();
         let send = |p: Value, said: String| {
             run.phoned.store(true, Ordering::SeqCst);
-            self.push_feed_with(bot, "phone", &said, None, false, Some(&p));
+            self.push_feed_with(bot, "phone", &said, None, false, Some(&p), None);
             run.push(json!({"type": "phone", "id": p["id"], "phone": p}));
         };
         match name {
@@ -965,6 +1062,9 @@ impl Bots {
                 Err(e) => out(e, false),
             };
         }
+        if self.teaching().is_some() {
+            return out("The user is using the computer's browser right now (teaching a Bot a task). Try the browser again in a few minutes, or do without it.".into(), false);
+        }
         let cmd = match name {
             "browser_open" => json!({"do": "open", "url": a["url"]}),
             "browser_click" => json!({"do": "click", "element": a["element"]}),
@@ -1077,8 +1177,10 @@ impl Bots {
              - Do the work, then reply briefly: what you did and what you found. The user reads you on a phone, so keep it short and clear, and link your web sources.\n\
              - If something needs the user (a decision, a login, a missing detail), ask once, clearly.\n\
              {computer}{google}{phone}             - You only act when the user writes or a routine starts you. For anything regular or later (\"every morning\", \"on Friday\"), propose a routine with schedule_routine; it runs once the user approves it. Never promise to do something later any other way.\n\n\
-             Your routines:\n{routines}\n\n\
+             Your routines:\n{routines}{skills}{others}\n\n\
              Current date and time: {now}",
+            skills = self.skills_note(),
+            others = self.others_note(bot),
             name = bot.name,
             job = if bot.job.is_empty() { "(none given yet: ask the user what they'd like you to do)" } else { &bot.job },
             memory = if memory.trim().is_empty() { "(nothing yet)".to_string() } else { memory.trim().to_string() },
@@ -1127,18 +1229,55 @@ impl Bots {
 
     /// Stored messages → the model's messages (OpenAI shape), recent ones only, old tool results cut.
     pub fn conversation(stored: &[Value]) -> Vec<Value> {
-        let mut recent: Vec<&Value> = stored.iter().rev().take(HISTORY_MESSAGES).collect::<Vec<_>>().into_iter().rev().collect();
-        // Start at a message from the user, so no tool result is left without the call it answers.
-        while recent.first().is_some_and(|m| m["role"] != "user") {
+        Self::conversation_for(stored, &View::default())
+    }
+
+    /// The same, as `view.me` reads it: in a group, the other Bots' replies come as messages to it
+    /// ("[Name said:] …", their tool steps left out). The latest message's /skills get their steps.
+    pub fn conversation_for(stored: &[Value], view: &View) -> Vec<Value> {
+        let other = |m: &Value| view.me.is_some_and(|me| m["role"] != "user" && m["bot"].as_str() != Some(me));
+        let mut recent: Vec<&Value> = stored
+            .iter()
+            .filter(|m| !(other(m) && (m["role"] == "tool" || m["text"].as_str().is_none_or(|t| t.trim().is_empty()))))
+            .rev()
+            .take(HISTORY_MESSAGES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        // Start at a message from the user (or another Bot), so no tool result is left without the call it answers.
+        while recent.first().is_some_and(|m| m["role"] != "user" && !other(m)) {
             recent.remove(0);
         }
         let last_user = recent.iter().rposition(|m| m["role"] == "user").unwrap_or(0);
         let mut out = vec![];
         for (i, m) in recent.iter().enumerate() {
             let text = m["text"].as_str().unwrap_or("");
+            if other(m) {
+                let name = m["bot"].as_str().and_then(|b| view.names.get(b)).map(String::as_str).unwrap_or("Another Bot");
+                out.push(json!({"role": "user", "content": format!("[{name} said:]\n{text}")}));
+                continue;
+            }
             match m["role"].as_str() {
-                Some("user") if m["routine"].is_object() => out.push(json!({"role": "user", "content": routine_prompt(&m["routine"], text)})),
-                Some("user") => out.push(json!({"role": "user", "content": text})),
+                Some("user") => {
+                    let mut content = if m["routine"].is_object() {
+                        routine_prompt(&m["routine"], text)
+                    } else if m["from"].is_object() {
+                        handoff_prompt(&m["from"], text)
+                    } else if let Some(steps) = m["taught"].as_array() {
+                        teach::prompt(text, steps)
+                    } else {
+                        text.to_string()
+                    };
+                    if i == last_user {
+                        for name in skills::called(text) {
+                            if let Some(sk) = view.skills.iter().find(|s| s.name == name) {
+                                content += &format!("\n\n[The user called the skill /{}. Follow its steps:]\n{}", sk.name, sk.steps);
+                            }
+                        }
+                    }
+                    out.push(json!({"role": "user", "content": content}));
+                }
                 Some("assistant") => {
                     // Only calls that have their result here (a provider refuses a call left unanswered).
                     let answered = |id: &Value| recent[i + 1..].iter().any(|r| r["role"] == "tool" && &r["call"] == id);
@@ -1196,7 +1335,7 @@ impl Bots {
         let mut steps = 0;
         let outcome = loop {
             let (n, outcome) = match self.endpoint(&bot) {
-                Ok(e) => self.steps(&bot, &run, &e),
+                Ok(e) => self.steps(&bot, &run, &e, &Thread::Bot(bot.id.clone()), ""),
                 Err(m) => (0, Err(m)),
             };
             steps += n;
@@ -1220,8 +1359,20 @@ impl Bots {
         crate::log(&format!("bot {} run ended after {steps} turns in {:.1} s ({})", bot.id, started.elapsed().as_secs_f64(), if outcome.is_ok() { "ok" } else { "error" }));
     }
 
-    fn steps(&self, bot: &Bot, run: &Run, endpoint: &brain::Endpoint) -> (usize, Result<(), String>) {
+    fn steps(self: &Arc<Bots>, bot: &Bot, run: &Run, endpoint: &brain::Endpoint, thread: &Thread, extra: &str) -> (usize, Result<(), String>) {
+        let group = matches!(thread, Thread::Group(_));
+        // Stores a message of this turn's (in a group, marked as this Bot's) and tells the phone.
+        let post = |mut m: Value| {
+            if group {
+                m["bot"] = bot.id.clone().into();
+            }
+            self.append_to(thread, &m);
+            run.push(json!({"type": "message", "message": m}));
+        };
+        let everyone = self.list();
+        let others = everyone.iter().any(|b| b.id != bot.id);
         let mut tools = tools::definitions(self.has_computer(bot), self.has_google(bot));
+        tools.as_array_mut().unwrap().extend(tools::team_definitions(others).as_array().unwrap().iter().cloned());
         if bot.phone {
             tools.as_array_mut().unwrap().extend(tools::phone_definitions().as_array().unwrap().iter().cloned());
         }
@@ -1242,19 +1393,18 @@ impl Bots {
                 return (turns, Ok(()));
             }
             if since_user >= MAX_STEPS {
-                let msg = json!({"id": new_id(), "role": "assistant", "text": format!("I stopped after {MAX_STEPS} steps without finishing. Tell me how to go on, or narrow the task down."), "at": now_ms(), "model": bot.model});
-                self.append(&bot.id, &msg);
-                run.push(json!({"type": "message", "message": msg}));
+                post(json!({"id": new_id(), "role": "assistant", "text": format!("I stopped after {MAX_STEPS} steps without finishing. Tell me how to go on, or narrow the task down."), "at": now_ms(), "model": bot.model}));
                 return (turns, Ok(()));
             }
-            let mut messages = vec![json!({"role": "system", "content": self.system(bot) + &apps_note})];
-            messages.extend(Self::conversation(&self.messages(&bot.id)));
+            let mut messages = vec![json!({"role": "system", "content": self.system(bot) + &apps_note + extra})];
+            let view = View { me: group.then_some(bot.id.as_str()), names: everyone.iter().map(|b| (b.id.clone(), b.name.clone())).collect(), skills: self.skills.approved() };
+            messages.extend(Self::conversation_for(&self.thread_messages(thread), &view));
             if let Some(n) = nudge.take() {
                 messages.push(json!({"role": "user", "content": n}));
             }
             let turn_start = std::time::Instant::now();
             let at = now_ms();
-            run.push(json!({"type": "thinking"}));
+            run.push(json!({"type": "thinking", "bot": bot.id}));
             if endpoint.is_local()
                 && let Some(m) = &self.media
             {
@@ -1287,8 +1437,7 @@ impl Bots {
                 msg["stopped"] = true.into();
             }
             if !turn.text.is_empty() || !turn.calls.is_empty() || run.stop.load(Ordering::SeqCst) {
-                self.append(&bot.id, &msg);
-                run.push(json!({"type": "message", "message": msg}));
+                post(msg);
             }
             if run.stop.load(Ordering::SeqCst) {
                 return (turns, Ok(()));
@@ -1317,6 +1466,10 @@ impl Bots {
                     run.push(json!({"type": "tool", "id": c.id, "name": c.name, "args": c.args}));
                     if tools::ROUTINE_TOOLS.contains(&c.name.as_str()) {
                         (self.routine_tool(bot, &c.name, &c.args), false)
+                    } else if tools::SKILL_TOOLS.contains(&c.name.as_str()) {
+                        (self.skill_tool(bot, &c.name, &c.args), false)
+                    } else if c.name == "ask_bot" {
+                        (self.ask_bot(bot, run, &c.args), false)
                     } else if tools::COMPUTER_TOOLS.contains(&c.name.as_str()) {
                         self.computer_tool(bot, run, &c.name, &c.args, &tid)
                     } else if tools::GOOGLE_TOOLS.contains(&c.name.as_str()) {
@@ -1339,17 +1492,14 @@ impl Bots {
                 if !out.ok {
                     tmsg["failed"] = true.into();
                 }
-                self.append(&bot.id, &tmsg);
-                run.push(json!({"type": "message", "message": tmsg}));
+                post(tmsg);
             }
             // Said no: the turn ends here with a reply that says so (small models otherwise report the
             // action as done, copying earlier turns where it was).
             if let Some(what) = run.denied.lock().unwrap().take() {
                 let mut first = what.chars();
                 let lower: String = first.next().map(|c| c.to_lowercase().chain(first).collect()).unwrap_or_default();
-                let msg = json!({"id": new_id(), "role": "assistant", "text": format!("I didn't {lower}, because you said no. What would you like me to do instead?"), "at": now_ms(), "model": bot.model});
-                self.append(&bot.id, &msg);
-                run.push(json!({"type": "message", "message": msg}));
+                post(json!({"id": new_id(), "role": "assistant", "text": format!("I didn't {lower}, because you said no. What would you like me to do instead?"), "at": now_ms(), "model": bot.model}));
                 return (turns, Ok(()));
             }
             if !run.inbox.lock().unwrap().is_empty() {
@@ -1357,6 +1507,26 @@ impl Bots {
             }
         }
     }
+}
+
+/// Who reads a stored chat (see `Bots::conversation_for`).
+#[derive(Default)]
+pub struct View<'a> {
+    /// In a group: the Bot whose turn it is.
+    pub me: Option<&'a str>,
+    /// Bot id → name, for the other Bots' messages.
+    pub names: HashMap<String, String>,
+    /// The approved skills, for the /names the latest message calls.
+    pub skills: Vec<skills::Skill>,
+}
+
+/// A task another Bot handed over, as the model reads it.
+fn handoff_prompt(from: &Value, task: &str) -> String {
+    let name = from["name"].as_str().unwrap_or("another Bot");
+    format!(
+        "({name}, another of the user's Bots, asks you this; it isn't the user. Do it, then reply with just your answer, complete and to the point: \
+         your reply is passed back to {name} as it is, so don't add headings or say who it's for.)\n\n{task}"
+    )
 }
 
 /// A routine's message as the model reads it: what it is, that nobody's watching, and the task.
@@ -1403,3 +1573,377 @@ fn describe_page(p: &Value) -> (String, Vec<String>) {
     let cites = if url.starts_with("http") { vec![url] } else { vec![] };
     (t, cites)
 }
+
+// --- Skills, handoffs and group chats ----------------------------------------------------------------
+
+impl Bots {
+    /// The skills, by name and a line each, for the system prompt.
+    fn skills_note(&self) -> String {
+        let list = self.skills.approved();
+        let mut t = String::from(
+            "\n\nSkills (saved how-tos shared by all the user's Bots; use_skill gives one's steps):\n",
+        );
+        if list.is_empty() {
+            t += "(none yet)";
+        } else {
+            let lines: Vec<String> = list.iter().take(skills::LISTED).map(|s| format!("- /{}: {}", s.name, if s.about.is_empty() { "(no description)" } else { &s.about })).collect();
+            t += &lines.join("\n");
+            if list.len() > skills::LISTED {
+                t += &format!("\n(and {} more)", list.len() - skills::LISTED);
+            }
+        }
+        t + "\nFollow a skill when the user calls it (/name) or when a task clearly matches one. When you've found a reliable way to do a task that will come up again, \
+             or the user asks you to remember how, propose a skill with save_skill (the user approves it; give an existing name to improve that one)."
+    }
+
+    /// The user's other Bots, for the system prompt (empty when there are none).
+    fn others_note(&self, bot: &Bot) -> String {
+        let others: Vec<Bot> = self.list().into_iter().filter(|b| b.id != bot.id).collect();
+        if others.is_empty() {
+            return String::new();
+        }
+        let lines: Vec<String> = others.iter().take(LISTED_BOTS).map(|b| format!("- {}: {}", b.name, groups::first_line(&b.job, 120))).collect();
+        format!(
+            "\n\nThe user's other Bots:\n{}\nWhen part of a task is clearly another Bot's job, hand it over with ask_bot: it does the work and its answer comes back to you. Don't hand over what you can do yourself.",
+            lines.join("\n")
+        )
+    }
+
+    fn skill_tool(&self, bot: &Bot, name: &str, args: &str) -> tools::Outcome {
+        let a: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+        let out = |text: String, ok: bool| tools::Outcome { text, citations: vec![], ok };
+        let s = |k: &str| a[k].as_str().unwrap_or("").trim().to_string();
+        match name {
+            "use_skill" => match self.skills.find(&s("name")) {
+                Some(sk) => out(format!("Skill /{} ({}):\n{}", sk.name, sk.about, sk.steps), true),
+                None => {
+                    let names: Vec<String> = self.skills.approved().iter().map(|k| format!("/{}", k.name)).collect();
+                    out(format!("There's no skill called {:?}. The skills: {}.", s("name"), if names.is_empty() { "none yet".into() } else { names.join(", ") }), false)
+                }
+            },
+            "save_skill" => match self.skills.propose(&bot.id, &bot.name, &s("name"), &s("about"), &s("steps")) {
+                Ok(sk) => {
+                    let what = if sk.replaces.is_some() { format!("a change to the skill /{}", sk.name) } else { format!("the skill /{}", sk.name) };
+                    self.push_feed(bot, "approval", &format!("wants to save {what}. Look at it in the Bot's chat."), None, false);
+                    out(format!("Proposed {what}. It's used once the user approves it on their phone; tell them so in your reply."), true)
+                }
+                Err(e) => out(format!("Couldn't propose it: {e}"), false),
+            },
+            other => out(format!("There's no tool called {other:?}."), false),
+        }
+    }
+
+    /// Hands a task to another Bot and waits for its answer. That Bot works in its own chat (where
+    /// the user sees the task and its answer); risky steps there still ask the user.
+    fn ask_bot(self: &Arc<Bots>, bot: &Bot, run: &Run, args: &str) -> tools::Outcome {
+        let a: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+        let out = |text: String, ok: bool| tools::Outcome { text, citations: vec![], ok };
+        let want = a["bot"].as_str().unwrap_or("").trim().trim_start_matches('@').to_string();
+        let task = a["task"].as_str().unwrap_or("").trim().to_string();
+        if task.is_empty() {
+            return out("Say what the other Bot should do (task).".into(), false);
+        }
+        let others: Vec<Bot> = self.list().into_iter().filter(|b| b.id != bot.id).collect();
+        let found = groups::mentions(&format!("@{want}"), &others).first().and_then(|id| others.iter().find(|b| &b.id == id)).cloned();
+        let Some(target) = found else {
+            let names: Vec<&str> = others.iter().map(|b| b.name.as_str()).collect();
+            return out(format!("There's no other Bot called {want:?}. The others: {}.", if names.is_empty() { "none".to_string() } else { names.join(", ") }), false);
+        };
+        let key = (bot.id.clone(), target.id.clone());
+        if let Some(said) = run.asked.lock().unwrap().get(&key) {
+            return out(format!("You asked {} already in this turn. Its answer:\n{said}\n\nUse that; don't ask again.", target.name), true);
+        }
+        // Never two Bots waiting on each other, and no long chains.
+        {
+            let mut waits = self.waits.lock().unwrap();
+            let mut cur = target.id.clone();
+            let mut seen = 0;
+            while let Some(next) = waits.get(&cur) {
+                if next == &bot.id {
+                    return out(format!("{} is waiting on you already; answer it first instead of asking it back.", target.name), false);
+                }
+                cur = next.clone();
+                seen += 1;
+                if seen > MAX_SUBSTEPS {
+                    break;
+                }
+            }
+            let mut depth = 0;
+            let mut back = bot.id.clone();
+            while let Some((who, _)) = waits.iter().find(|(_, t)| **t == back) {
+                depth += 1;
+                back = who.clone();
+                if depth > MAX_SUBSTEPS {
+                    break;
+                }
+            }
+            if depth + 1 >= MAX_HANDOFF_CHAIN {
+                return out("Too many Bots are handing this on already; do the rest yourself.".into(), false);
+            }
+            waits.insert(bot.id.clone(), target.id.clone());
+        }
+        let started = now_ms();
+        let from = json!({"bot": bot.id, "name": bot.name, "color": bot.color});
+        let msg = json!({"id": new_id(), "role": "user", "text": task.chars().take(20_000).collect::<String>(), "at": started, "from": from});
+        crate::log(&format!("bot {} handed a task to bot {}", bot.id, target.id));
+        let (sent, theirs) = self.launch(Thread::Bot(target.id.clone()), msg, |r| *r.from.lock().unwrap() = Some(from.clone()));
+        let queued = sent["queued"] == true;
+        let end = std::time::Instant::now() + HANDOFF_WAIT;
+        let mut stopped = false;
+        while !theirs.done.load(Ordering::SeqCst) {
+            if run.stop.load(Ordering::SeqCst) {
+                // Stopping this Bot stops what it started (not a run the other Bot was on already).
+                if !queued {
+                    self.stop(&target.id);
+                }
+                stopped = true;
+                break;
+            }
+            if std::time::Instant::now() > end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        self.waits.lock().unwrap().remove(&bot.id);
+        if stopped {
+            return out("Not done: the user stopped you.".into(), false);
+        }
+        let answer = self.messages(&target.id).into_iter().rev().find(|m| m["role"] == "assistant" && m["at"].as_u64().unwrap_or(0) >= started && (m["text"].as_str().is_some_and(|t| !t.trim().is_empty()) || m["error"].is_string()));
+        match answer {
+            Some(m) if m["error"].is_string() => out(format!("{} couldn't do it: {}", target.name, m["error"].as_str().unwrap()), false),
+            Some(m) => {
+                let t: String = m["text"].as_str().unwrap_or("").chars().take(12_000).collect();
+                run.asked.lock().unwrap().insert(key, t.clone());
+                out(format!("{} answered:\n{t}", target.name), true)
+            }
+            None if !theirs.done.load(Ordering::SeqCst) => out(format!("{} is still working on it after {} minutes; tell the user it's under way in {}'s chat.", target.name, HANDOFF_WAIT.as_secs() / 60, target.name), false),
+            None => out(format!("{} ended without an answer.", target.name), false),
+        }
+    }
+
+    // Groups.
+
+    fn groups_dir(&self) -> PathBuf {
+        self.paths.bots.join("groups")
+    }
+
+    pub fn group(&self, id: &str) -> Option<groups::Group> {
+        if !valid_id(id) {
+            return None;
+        }
+        let v = serde_json::from_slice::<Value>(&std::fs::read(self.groups_dir().join(id).join("group.json")).ok()?).ok()?;
+        groups::Group::from_json(&v)
+    }
+
+    pub fn groups(&self) -> Vec<groups::Group> {
+        let mut out: Vec<groups::Group> = std::fs::read_dir(self.groups_dir()).into_iter().flatten().flatten().filter_map(|e| self.group(&e.file_name().to_string_lossy())).collect();
+        out.sort_by(|a, b| a.created.total_cmp(&b.created));
+        out
+    }
+
+    fn save_group(&self, g: &groups::Group) -> Result<(), String> {
+        if !valid_id(&g.id) {
+            return Err("Bad group id".into());
+        }
+        write_private(&self.groups_dir().join(&g.id).join("group.json"), serde_json::to_string_pretty(&g.to_json()).unwrap().as_bytes())
+    }
+
+    pub fn create_group(&self, v: &Value) -> Result<groups::Group, String> {
+        let _g = self.groups_lock.lock().unwrap();
+        if self.groups().len() >= groups::MAX_GROUPS {
+            return Err(format!("You have {} groups already; delete one first.", groups::MAX_GROUPS));
+        }
+        let mut g = groups::Group { id: new_id(), name: String::new(), members: vec![], created: crate::time::now() };
+        g.apply(v, |id| self.get(id).is_some())?;
+        self.save_group(&g)?;
+        Ok(g)
+    }
+
+    pub fn update_group(&self, id: &str, v: &Value) -> Result<groups::Group, String> {
+        let _g = self.groups_lock.lock().unwrap();
+        let mut g = self.group(id).ok_or("No such group (it may have been deleted).")?;
+        g.apply(v, |id| self.get(id).is_some())?;
+        self.save_group(&g)?;
+        Ok(g)
+    }
+
+    pub fn delete_group(&self, id: &str) -> bool {
+        if self.group(id).is_none() {
+            return false;
+        }
+        if let Some(r) = self.runs.lock().unwrap().remove(&format!("g:{id}")) {
+            r.stop.store(true, Ordering::SeqCst);
+        }
+        std::fs::remove_dir_all(self.groups_dir().join(id)).is_ok()
+    }
+
+    /// A deleted Bot leaves its groups (a group keeps its chat even with one Bot left).
+    fn leave_groups(&self, bot: &str) {
+        let _g = self.groups_lock.lock().unwrap();
+        for mut g in self.groups() {
+            if g.members.iter().any(|m| m == bot) {
+                g.members.retain(|m| m != bot);
+                let _ = self.save_group(&g);
+            }
+        }
+    }
+
+    /// The user's message in a group.
+    pub fn send_group(self: &Arc<Bots>, gid: &str, text: &str) -> Result<Value, String> {
+        self.group(gid).ok_or("No such group (it may have been deleted).")?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("Write something first.".into());
+        }
+        if text.chars().count() > 50_000 {
+            return Err("That message is too long.".into());
+        }
+        let msg = json!({"id": new_id(), "role": "user", "text": text, "at": now_ms()});
+        Ok(self.launch(Thread::Group(gid.to_string()), msg, |_| {}).0)
+    }
+
+    /// Who answers the user's new message when it names nobody: the router's pick (the first
+    /// member's model, asked in a few words), else whoever spoke last, else the first member.
+    fn route(&self, group: &groups::Group, members: &[Bot], stored: &[Value], run: &Run) -> String {
+        let names: HashMap<&str, &str> = members.iter().map(|b| (b.id.as_str(), b.name.as_str())).collect();
+        let last_bot = stored.iter().rev().find_map(|m| m["bot"].as_str().filter(|b| names.contains_key(b)).map(String::from));
+        let fallback = last_bot.unwrap_or_else(|| members[0].id.clone());
+        if members.len() == 1 {
+            return fallback;
+        }
+        let recent: Vec<(String, String)> = stored
+            .iter()
+            .filter(|m| m["role"] != "tool" && m["text"].as_str().is_some_and(|t| !t.trim().is_empty()))
+            .rev()
+            .take(8)
+            .map(|m| {
+                let who = if m["role"] == "user" { "User".to_string() } else { m["bot"].as_str().and_then(|b| names.get(b)).unwrap_or(&"A Bot").to_string() };
+                (who, m["text"].as_str().unwrap_or("").to_string())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let Ok(endpoint) = self.endpoint(&members[0]) else { return fallback };
+        let messages = groups::router_messages(group, members, &recent);
+        let started = std::time::Instant::now();
+        let turn = brain::turn(&endpoint, &self.ollama, &messages, &json!([]), 4096, self.settings.keep_alive(), &run.stop, &mut |_| {});
+        let picked = turn.ok().and_then(|t| groups::pick(&t.text, members));
+        crate::log(&format!("group {} routed in {:.1} s ({})", group.id, started.elapsed().as_secs_f64(), if picked.is_some() { "picked" } else { "fallback" }));
+        picked.unwrap_or(fallback)
+    }
+
+    /// A group's run: each new message of the user's goes to the Bots it names (or the best fit),
+    /// and to any Bot those @mention in their replies, one after another.
+    fn work_group(self: Arc<Bots>, gid: String, run: Arc<Run>, first_at: u64) {
+        let thread = Thread::Group(gid.clone());
+        let started_ms = now_ms();
+        crate::log(&format!("group {gid} run started"));
+        // The latest user message already answered (by its time): the ones before this run's first.
+        let mut handled: u64 = first_at.saturating_sub(1);
+        let mut last_speaker: Option<Bot> = None;
+        let mut outcome: Result<(), String> = Ok(());
+        loop {
+            let Some(group) = self.group(&gid) else {
+                outcome = Err("This group was deleted.".into());
+                break;
+            };
+            let members: Vec<Bot> = group.members.iter().filter_map(|m| self.get(m)).collect();
+            let stored = self.thread_messages(&thread);
+            let new: Vec<&Value> = stored.iter().filter(|m| m["role"] == "user" && m["at"].as_u64().unwrap_or(0) > handled).collect();
+            if let Some(at) = new.iter().filter_map(|m| m["at"].as_u64()).max() {
+                handled = at;
+            }
+            run.inbox.lock().unwrap().clear();
+            if !new.is_empty() && !members.is_empty() && !run.stop.load(Ordering::SeqCst) {
+                let said: Vec<&str> = new.iter().filter_map(|m| m["text"].as_str()).collect();
+                let mut queue = groups::mentions(&said.join("\n"), &members);
+                if queue.is_empty() {
+                    queue.push(self.route(&group, &members, &stored, &run));
+                }
+                let mut turns = 0;
+                // Each Bot speaks once per message of the user's: a mention from another Bot
+                // ("thanks @Writer!") doesn't bring back one already heard from.
+                let mut heard: HashSet<String> = HashSet::new();
+                run.asked.lock().unwrap().clear();
+                while !queue.is_empty() && turns < groups::MAX_TURNS && !run.stop.load(Ordering::SeqCst) {
+                    let id = queue.remove(0);
+                    let Some(bot) = members.iter().find(|b| b.id == id).cloned() else { continue };
+                    turns += 1;
+                    heard.insert(bot.id.clone());
+                    let before = now_ms();
+                    let others: Vec<String> = members.iter().filter(|b| b.id != bot.id).map(|b| format!("- {}: {}", b.name, groups::first_line(&b.job, 160))).collect();
+                    let note = format!(
+                        "\n\nYou're in the group chat “{}” with the user and these Bots:\n{}\n\
+                         Their messages come marked [Name said:]. It's your turn now: answer for yourself only, never write the other Bots' replies. \
+                         To bring one in (when part of the task is its job), @mention it by name in your reply, like @{}, and say what you need from it; it answers after you. \
+                         Mention a Bot only when you need it. Keep it short: this is a chat.",
+                        group.name,
+                        others.join("\n"),
+                        members.iter().find(|b| b.id != bot.id).map(|b| b.name.as_str()).unwrap_or("Name"),
+                    );
+                    let res = match self.endpoint(&bot) {
+                        Ok(e) => self.steps(&bot, &run, &e, &thread, &note).1,
+                        Err(m) => Err(m),
+                    };
+                    last_speaker = Some(bot.clone());
+                    if let Err(m) = &res {
+                        let msg = json!({"id": new_id(), "role": "assistant", "text": "", "error": m, "at": now_ms(), "model": bot.model, "bot": bot.id});
+                        self.append_to(&thread, &msg);
+                        run.push(json!({"type": "message", "message": msg}));
+                        outcome = res.clone();
+                    } else {
+                        let reply = self.thread_messages(&thread).into_iter().rev().find(|m| m["bot"] == bot.id.as_str() && m["role"] == "assistant" && m["at"].as_u64().unwrap_or(0) >= before);
+                        let text = reply.as_ref().and_then(|m| m["text"].as_str()).unwrap_or("");
+                        // One it asked with ask_bot has answered already.
+                        heard.extend(run.asked.lock().unwrap().keys().filter(|(asker, _)| asker == &bot.id).map(|(_, asked)| asked.clone()));
+                        for next in groups::mentions(text, &members) {
+                            if !heard.contains(&next) && !queue.contains(&next) {
+                                queue.push(next);
+                            }
+                        }
+                    }
+                    // The user said something new meanwhile: that's routed afresh.
+                    if self.thread_messages(&thread).iter().any(|m| m["role"] == "user" && m["at"].as_u64().unwrap_or(0) > handled) {
+                        break;
+                    }
+                }
+            }
+            // Done only once nothing new waits, under the lock `launch` takes (see `work`).
+            let _runs = self.runs.lock().unwrap();
+            let waiting = self.thread_messages(&thread).iter().any(|m| m["role"] == "user" && m["at"].as_u64().unwrap_or(0) > handled);
+            if waiting && !run.stop.load(Ordering::SeqCst) {
+                continue;
+            }
+            if let (Some(bot), Some(g)) = (&last_speaker, self.group(&gid)) {
+                self.feed_group(&g, bot, &run, &outcome, started_ms);
+            }
+            run.done.store(true, Ordering::SeqCst);
+            run.push(json!({"type": "done", "error": outcome.as_ref().err(), "stopped": run.stop.load(Ordering::SeqCst)}));
+            break;
+        }
+        crate::log(&format!("group {gid} run ended ({})", if outcome.is_ok() { "ok" } else { "error" }));
+    }
+
+    /// A group run's end for the phone's notifications: the last Bot's reply, marked with the group.
+    fn feed_group(&self, g: &groups::Group, bot: &Bot, run: &Run, outcome: &Result<(), String>, started_ms: u64) {
+        if run.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let text = match outcome {
+            Err(e) => e.clone(),
+            Ok(()) => self
+                .thread_messages(&Thread::Group(g.id.clone()))
+                .into_iter()
+                .rev()
+                .find(|m| m["role"] == "assistant" && m["at"].as_u64().unwrap_or(0) >= started_ms && m["text"].as_str().is_some_and(|t| !t.trim().is_empty()))
+                .and_then(|m| m["text"].as_str().map(String::from))
+                .unwrap_or_default(),
+        };
+        let kind = if outcome.is_err() { "error" } else { "reply" };
+        self.push_feed_with(bot, kind, &text, None, run.phoned.load(Ordering::SeqCst), None, Some(&json!({"id": g.id, "name": g.name})));
+    }
+}
+
+/// A loop guard for walking the handoff map.
+const MAX_SUBSTEPS: usize = 16;

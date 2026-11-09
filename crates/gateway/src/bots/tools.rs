@@ -19,6 +19,9 @@ pub const GOOGLE_TOOLS: [&str; 12] = [
     "gmail_search", "gmail_read", "gmail_send", "gmail_draft", "calendar_events", "calendar_create", "calendar_update", "calendar_delete", "drive_search", "drive_read", "drive_download", "drive_create",
 ];
 
+/// The shared skills library (skills.rs), run by the Bots engine.
+pub const SKILL_TOOLS: [&str; 2] = ["use_skill", "save_skill"];
+
 /// The user's phone, offered unless the user switched it off for the Bot.
 pub const PHONE_TOOLS: [&str; 6] = ["phone_remind", "phone_notify", "phone_copy", "phone_open", "phone_location", "phone_status"];
 
@@ -56,6 +59,33 @@ pub fn definitions(computer: bool, google: bool) -> Value {
         all.as_array_mut().unwrap().extend(google_definitions().as_array().unwrap().iter().cloned());
     }
     all
+}
+
+/// Skills (always) and handing a task to another Bot (when there's another).
+pub fn team_definitions(others: bool) -> Value {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let mut all = vec![
+        function("use_skill", "Get the steps of one of the saved skills (listed in your instructions), to follow them.", json!({"name": s("The skill's name, e.g. check-bill.")}), &["name"]),
+        function(
+            "save_skill",
+            "Propose a skill: a saved how-to for a task that comes up again, usable by all the user's Bots (and by the user as /name). The user approves it first. Give an existing skill's name to propose a better version of it.",
+            json!({
+                "name": s("A short name in lowercase with dashes, e.g. check-bill."),
+                "about": s("One line: what it's for."),
+                "steps": s("Numbered steps that work again next time: inputs that change each time, where to go, what to do, what to check, what to report, and what to do when a step fails.")
+            }),
+            &["name", "about", "steps"],
+        ),
+    ];
+    if others {
+        all.push(function(
+            "ask_bot",
+            "Hand a task to another of the user's Bots (by name) and wait for its answer. It works in its own chat with its own tools and memory. Use it when the task is clearly that Bot's job.",
+            json!({"bot": s("The other Bot's name."), "task": s("What it should do, with everything it needs to know (it hasn't seen this chat).")}),
+            &["bot", "task"],
+        ));
+    }
+    Value::Array(all)
 }
 
 pub fn phone_definitions() -> Value {

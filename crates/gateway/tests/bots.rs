@@ -97,6 +97,44 @@ fn conn(tcp: TcpStream, seen: Arc<Mutex<Seen>>) {
             let msgs = body["messages"].as_array().unwrap();
             let last = msgs.last().unwrap();
             let user = last_user(&body);
+            let system = msgs[0]["content"].as_str().unwrap_or("");
+            let lc = last["content"].as_str().unwrap_or("");
+            // Group chats: the router, then each Bot by its name.
+            if system.contains("You pick who answers") {
+                return sse(&mut c, &[text("Writer"), finish("stop")], Duration::ZERO);
+            }
+            if system.starts_with("You are Researcher,") && last["role"] == "user" && lc.contains("find") {
+                return sse(&mut c, &[text("Found three sources. @Writer please write it up."), finish("stop")], Duration::ZERO);
+            }
+            if system.starts_with("You are Writer,") && last["role"] == "user" && lc.starts_with("[Researcher said:]") {
+                return sse(&mut c, &[text("Written up. Thanks @Researcher!"), finish("stop")], Duration::ZERO);
+            }
+            if system.starts_with("You are Writer,") && last["role"] == "user" && lc.contains("who's free") {
+                return sse(&mut c, &[text("Writer here."), finish("stop")], Duration::ZERO);
+            }
+            // Handoffs: Scout hands a haiku to Writer.
+            if last["role"] == "user" && user.contains("ask the writer") {
+                return sse(&mut c, &[call(0, "h1", "ask_bot", r#"{"bot": "writer", "task": "Write a haiku about rain."}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if system.starts_with("You are Writer,") && last["role"] == "user" && lc.contains("(Scout, another of the user's Bots, asks you this") {
+                return sse(&mut c, &[text("Soft rain on the roof."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "ask_bot" && user.contains("twice") && msgs.iter().rev().take_while(|m| m["role"] != "user").filter(|m| m["role"] == "tool").count() == 1 {
+                return sse(&mut c, &[call(0, "h2", "ask_bot", r#"{"bot": "Writer", "task": "Write a haiku about rain, please."}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "ask_bot" {
+                return sse(&mut c, &[text(&format!("From Writer: {}", lc.lines().last().unwrap_or(""))), finish("stop")], Duration::ZERO);
+            }
+            // Skills: one proposed, and a taught task written up.
+            if last["role"] == "user" && (user.contains("save how") || user.contains("just showed you how")) {
+                return sse(&mut c, &[call(0, "s1", "save_skill", r#"{"name": "Find Cats", "about": "Find a cat picture", "steps": "1. Open the site\n2. Search for cats"}"#), finish("tool_calls")], Duration::ZERO);
+            }
+            if last["role"] == "tool" && last["name"] == "save_skill" {
+                return sse(&mut c, &[text("Proposed /find-cats."), finish("stop")], Duration::ZERO);
+            }
+            if last["role"] == "user" && user.contains("/check-bill") {
+                return sse(&mut c, &[text("Following the skill."), finish("stop")], Duration::ZERO);
+            }
             if last["role"] == "user" && user.contains("write_file now") {
                 return sse(&mut c, &[call(0, "w1", "write_file", r#"{"path": "notes/lazy.md", "content": "lazy"}"#), finish("tool_calls")], Duration::ZERO);
             }
@@ -329,6 +367,16 @@ if c.get("do") == "click" and not c.get("approved"):
     sys.exit()
 if c.get("do") == "click":
     shot.update(title="Thanks", text="Order placed")
+if c.get("do") in ("shot", "tap", "text", "key", "open_light", "scroll_light", "back_light"):
+    did = None
+    if c.get("do") == "tap":
+        did = {{"kind": "button", "label": "Search"}}
+    if c.get("do") == "text":
+        did = {{"kind": "password field", "label": "Password", "secret": True}} if c.get("text") == "hunter2" else {{"kind": "search box", "label": "Search"}}
+    url = "https://cats.example/results" if c.get("do") == "key" else "https://cats.example/"
+    open("{shots}/t.jpg", "wb").write(bytes([0xff, 0xd8, 0xff, 0xe1]))
+    print(json.dumps({{"ok": True, "url": url, "title": "Cats", "shot": "/shots/t.jpg", "did": did}}))
+    sys.exit()
 open("{shots}/s.jpg", "wb").write(bytes([0xff, 0xd8, 0xff, 0xe0]))
 print(json.dumps(shot if c.get("do") != "ping" else {{"ok": True}}))
 '
@@ -466,7 +514,7 @@ fn a_cloud_bot_searches_writes_and_remembers() {
     assert!(seen.auth.iter().all(|a| a == "Bearer sk-test"));
     let first = &seen.cloud[0];
     assert_eq!(first["model"], "test-model");
-    assert_eq!(first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(), ["web_search", "read_page", "list_files", "read_file", "write_file", "remember", "forget", "schedule_routine", "cancel_routine", "phone_remind", "phone_notify", "phone_copy", "phone_open", "phone_location", "phone_status"]);
+    assert_eq!(first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>(), ["web_search", "read_page", "list_files", "read_file", "write_file", "remember", "forget", "schedule_routine", "cancel_routine", "use_skill", "save_skill", "phone_remind", "phone_notify", "phone_copy", "phone_open", "phone_location", "phone_status"]);
     let system = first["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("You are Reporter,") && system.contains("Your job:\nKeep notes on CubicAI.") && system.contains("(nothing yet)"), "{system}");
     let third = seen.cloud[2]["messages"].as_array().unwrap();
@@ -1139,4 +1187,166 @@ fn the_phone_gets_reminders_and_answers_questions() {
     s.settle(&id);
     let sent = s.seen.lock().unwrap().cloud.last().unwrap().clone();
     assert!(!sent["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "phone_remind"));
+}
+
+#[test]
+fn skills_are_called_proposed_and_approved() {
+    let s = setup("skills");
+    s.custom_keys();
+    let id = s.make(json!({"name": "Scout", "provider": "custom", "model": "test-model"}));
+    let r = s.ask("POST", "/v1/skills", Some(json!({"name": "Check bill", "about": "Read this month's power bill", "steps": "1. Open the power company's site\n2. Read the amount"})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["skills"][0]["name"], "check-bill");
+    // Calling it: the steps go with that message, and every Bot's prompt lists the skill.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "/check-bill please"})));
+    s.settle(&id);
+    let sent = s.seen.lock().unwrap().cloud.last().unwrap().clone();
+    let user = last_user(&sent);
+    assert!(user.starts_with("/check-bill please\n\n[The user called the skill /check-bill. Follow its steps:]\n1. Open the power company"), "{user}");
+    assert!(sent["messages"][0]["content"].as_str().unwrap().contains("- /check-bill: Read this month's power bill"));
+    // A Bot's proposal waits for the user.
+    s.ask("POST", &format!("/v1/bots/{id}/messages"), Some(json!({"text": "save how you did that"})));
+    let chat = s.settle(&id);
+    assert_eq!(chat.last().unwrap()["text"], "Proposed /find-cats.");
+    let skills = s.ask("GET", "/v1/skills", None).json()["skills"].as_array().unwrap().clone();
+    let p = skills.iter().find(|k| k["name"] == "find-cats").unwrap().clone();
+    assert_eq!((p["approved"].clone(), p["by"].clone(), p["by_name"].clone()), (json!(false), json!(id), json!("Scout")));
+    let feed = s.ask("GET", "/v1/bots/feed?after=0", None).json()["items"].as_array().unwrap().clone();
+    assert!(feed.iter().any(|f| f["kind"] == "approval" && f["text"].as_str().unwrap().contains("/find-cats")));
+    let sys_before = s.seen.lock().unwrap().cloud.last().unwrap()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(!sys_before.contains("/find-cats"), "not used before it's approved");
+    let r = s.ask("PUT", &format!("/v1/skills/{}", p["id"].as_str().unwrap()), Some(json!({"approved": true}))).json();
+    assert!(r["skills"].as_array().unwrap().iter().all(|k| k["approved"] == true));
+    // Editing and deleting.
+    let r = s.ask("PUT", &format!("/v1/skills/{}", p["id"].as_str().unwrap()), Some(json!({"steps": ""})));
+    assert_eq!(r.status, 400, "steps can't be emptied");
+    s.ask("DELETE", &format!("/v1/skills/{}", p["id"].as_str().unwrap()), None);
+    assert_eq!(s.ask("GET", "/v1/skills", None).json()["skills"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_bot_hands_a_task_to_another_and_gets_the_answer() {
+    let s = setup("handoff");
+    s.custom_keys();
+    let scout = s.make(json!({"name": "Scout", "job": "Find things.", "provider": "custom", "model": "test-model"}));
+    let writer = s.make(json!({"name": "Writer", "job": "Writes poems and posts.", "provider": "custom", "model": "test-model"}));
+    s.ask("POST", &format!("/v1/bots/{scout}/messages"), Some(json!({"text": "ask the writer for a haiku"})));
+    let chat = s.settle(&scout);
+    assert_eq!(chat.last().unwrap()["text"], "From Writer: Soft rain on the roof.");
+    let tool = chat.iter().find(|m| m["tool"] == "ask_bot").unwrap();
+    assert_eq!(tool["text"], "Writer answered:\nSoft rain on the roof.");
+    // The task and the answer are in Writer's own chat; its prompt names the other Bots.
+    let theirs = s.settle(&writer);
+    assert_eq!(theirs[0]["from"]["name"], "Scout");
+    assert_eq!(theirs[0]["text"], "Write a haiku about rain.");
+    assert_eq!(theirs[1]["text"], "Soft rain on the roof.");
+    let seen = s.seen.lock().unwrap().cloud.clone();
+    let scout_sys = seen[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(scout_sys.contains("The user's other Bots:\n- Writer: Writes poems and posts."), "{scout_sys}");
+    assert!(seen[0]["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "ask_bot"));
+    // Writer's answer went back to Scout, so only Scout's reply notifies.
+    let feed = s.ask("GET", "/v1/bots/feed?after=0", None).json()["items"].as_array().unwrap().clone();
+    let loud: Vec<&str> = feed.iter().filter(|f| f["quiet"] == false).map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(loud, ["Scout"]);
+    // Asking the same Bot again in one turn gets the first answer back, without a second task.
+    s.ask("POST", &format!("/v1/bots/{scout}/messages"), Some(json!({"text": "ask the writer twice for a haiku"})));
+    let chat = s.settle(&scout);
+    let tools: Vec<&str> = chat.iter().filter(|m| m["tool"] == "ask_bot").map(|m| m["text"].as_str().unwrap()).collect();
+    assert_eq!(tools.len(), 3, "{tools:?}");
+    assert!(tools[2].starts_with("You asked Writer already in this turn. Its answer:\nSoft rain on the roof."), "{}", tools[2]);
+    assert_eq!(s.settle(&writer).iter().filter(|m| m["role"] == "user").count(), 2, "one task per turn");
+}
+
+#[test]
+fn groups_answer_by_mention_hand_on_and_route() {
+    let s = setup("groups");
+    s.custom_keys();
+    let res = s.make(json!({"name": "Researcher", "job": "Finds sources.", "provider": "custom", "model": "test-model"}));
+    let wri = s.make(json!({"name": "Writer", "job": "Writes things up.", "provider": "custom", "model": "test-model"}));
+    assert_eq!(s.ask("POST", "/v1/groups", Some(json!({"name": "Desk", "members": [res]}))).status, 400, "two Bots at least");
+    let g = s.ask("POST", "/v1/groups", Some(json!({"name": "Desk", "members": [res, wri]}))).json()["group"].clone();
+    let gid = g["id"].as_str().unwrap().to_string();
+    let settle = || {
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            let r = s.ask("GET", &format!("/v1/groups/{gid}/messages"), None).json();
+            if r["running"] == false {
+                return r["messages"].as_array().unwrap().clone();
+            }
+            assert!(Instant::now() < end, "the group never finished");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // @Researcher answers and brings Writer in, which reads Researcher's words as Researcher's.
+    s.ask("POST", &format!("/v1/groups/{gid}/messages"), Some(json!({"text": "@Researcher find me three sources on rain"})));
+    let chat = settle();
+    let said: Vec<(String, String)> = chat.iter().map(|m| (m["bot"].as_str().unwrap_or("user").to_string(), m["text"].as_str().unwrap_or("").to_string())).collect();
+    // Writer's thanks don't bring Researcher back: each Bot speaks once per message of the user's.
+    assert_eq!(said, [("user".into(), "@Researcher find me three sources on rain".into()), (res.clone(), "Found three sources. @Writer please write it up.".into()), (wri.clone(), "Written up. Thanks @Researcher!".into())]);
+    let writer_turn = s.seen.lock().unwrap().cloud.last().unwrap().clone();
+    let sys = writer_turn["messages"][0]["content"].as_str().unwrap();
+    assert!(sys.starts_with("You are Writer,") && sys.contains("You're in the group chat “Desk”") && sys.contains("- Researcher: Finds sources."), "{sys}");
+    // No mention: the router picks.
+    let calls = s.seen.lock().unwrap().cloud.len();
+    s.ask("POST", &format!("/v1/groups/{gid}/messages"), Some(json!({"text": "who's free to help?"})));
+    let chat = settle();
+    assert_eq!(chat.last().unwrap()["text"], "Writer here.");
+    assert_eq!(chat.last().unwrap()["bot"], wri.as_str());
+    let seen = s.seen.lock().unwrap().cloud[calls..].to_vec();
+    assert!(seen[0]["messages"][0]["content"].as_str().unwrap().contains("You pick who answers in the group chat “Desk”"));
+    assert!(seen[0].get("tools").is_none(), "the router gets no tools");
+    // The list and the feed know the group.
+    let list = s.ask("GET", "/v1/groups", None).json();
+    assert_eq!((list["groups"][0]["name"].clone(), list["groups"][0]["last"]["bot"].clone()), (json!("Desk"), json!(wri)));
+    let feed = s.ask("GET", "/v1/bots/feed?after=0", None).json()["items"].as_array().unwrap().clone();
+    assert!(feed.iter().all(|f| f["group"]["id"] == gid.as_str()), "{feed:?}");
+    // Deleting a Bot drops it from the group; deleting the group drops its chat.
+    s.ask("DELETE", &format!("/v1/bots/{res}"), None);
+    assert_eq!(s.ask("GET", &format!("/v1/groups/{gid}"), None).json()["group"]["members"], json!([wri]));
+    assert_eq!(s.ask("DELETE", &format!("/v1/groups/{gid}"), None).status, 200);
+    assert_eq!(s.ask("GET", &format!("/v1/groups/{gid}/messages"), None).status, 404);
+}
+
+#[test]
+fn teaching_records_steps_and_the_bot_writes_a_skill() {
+    let s = setup_with("teach", true);
+    s.custom_keys();
+    let id = s.make(json!({"name": "Scout", "provider": "custom", "model": "test-model"}));
+    let teach = |v: Value| {
+        let r = s.ask("POST", &format!("/v1/bots/{id}/teach"), Some(v));
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()
+    };
+    assert_eq!(s.ask("POST", &format!("/v1/bots/{id}/teach"), Some(json!({"do": "tap", "x": 0.5, "y": 0.5}))).status, 400, "a session starts first");
+    let st = teach(json!({"do": "start"}));
+    assert_eq!((st["steps"].clone(), st["shot"].clone()), (json!([]), json!(1)));
+    assert!(s.ask("GET", &format!("/v1/bots/{id}/teach/shot"), None).status == 200);
+    teach(json!({"do": "open", "url": "cats.example"}));
+    teach(json!({"do": "text", "text": "cats"}));
+    teach(json!({"do": "text", "text": "hunter2"}));
+    teach(json!({"do": "tap", "x": 0.5, "y": 0.1}));
+    let st = teach(json!({"do": "key", "key": "Enter"}));
+    assert_eq!(
+        st["steps"],
+        json!([
+            "Opened cats.example",
+            "Typed “cats” into the search box “Search”",
+            "Typed their password into the password field “Password” (not written down)",
+            "Clicked the button “Search”",
+            "Pressed Enter → now on “Cats” (https://cats.example/results)"
+        ])
+    );
+    // While it lasts, the Bots' own browser waits.
+    assert_eq!(s.gw.gateway.bots.as_ref().unwrap().teaching().as_deref(), Some(id.as_str()));
+    let r = s.ask("POST", &format!("/v1/bots/{id}/teach/done"), Some(json!({"what": "Finding a cat picture"})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let chat = s.settle(&id);
+    assert_eq!(chat[0]["text"], "Finding a cat picture");
+    assert!(!chat[0].to_string().contains("hunter2"), "a password is never kept");
+    assert_eq!(chat.last().unwrap()["text"], "Proposed /find-cats.");
+    let sent = s.seen.lock().unwrap().cloud[0].clone();
+    let user = last_user(&sent);
+    assert!(user.contains("What it's for: Finding a cat picture") && user.contains("4. Clicked the button “Search”"), "{user}");
+    assert!(s.gw.gateway.bots.as_ref().unwrap().teaching().is_none());
+    assert_eq!(s.ask("GET", "/v1/skills", None).json()["skills"][0]["approved"], false);
 }

@@ -5,6 +5,10 @@ POST / with {"do": open|click|type|scroll|state, ...}; answers with the page as 
 (title, address, text, numbered elements) and a screenshot in /shots. Clicking or pressing Enter in a
 form that POSTs (sends something somewhere) answers {"needs_approval": true, "what": ...} unless the
 command says "approved": true, so the gateway can ask the user first.
+
+The user teaching a task from the phone drives it by point instead: tap {x, y} (fractions of the
+screenshot), text {text} (typed into what has focus), key {key}, and shot (just a fresh screenshot).
+Those answer with only the address, title, screenshot and "did": what was tapped or typed into.
 """
 import json, os, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -62,6 +66,50 @@ IS_SUBMIT = """
   return false;
 }
 """
+
+
+# What is at a point (or has focus): the thing a person meant, described as a step would say it.
+DESCRIBE = """
+(at) => {
+  let e = at ? document.elementFromPoint(at[0], at[1]) : document.activeElement;
+  if (!e || e === document.body || e === document.documentElement) return null;
+  const sel = 'a[href], button, input, select, textarea, label, [role=button], [role=link], [role=tab], [role=menuitem], [role=checkbox], [onclick], [contenteditable=true]';
+  const hit = e.closest(sel) || e;
+  const tag = hit.tagName.toLowerCase();
+  let kind = tag === 'a' ? 'link' : tag === 'button' ? 'button' : tag === 'select' ? 'list' : tag === 'textarea' ? 'text box' : tag === 'label' ? 'label' : null;
+  if (tag === 'input') {
+    const t = (hit.type || 'text').toLowerCase();
+    kind = ['submit', 'button', 'image', 'reset'].includes(t) ? 'button' : t === 'checkbox' ? 'checkbox' : t === 'radio' ? 'option' : t === 'password' ? 'password field' : t === 'search' ? 'search box' : 'field';
+  }
+  const role = hit.getAttribute('role'); if (!kind && role) kind = role;
+  if (!kind) kind = hit.isContentEditable ? 'text box' : 'text';
+  let label = '';
+  if (hit.labels && hit.labels.length) label = hit.labels[0].innerText;
+  if (!label) label = hit.getAttribute('aria-label') || hit.getAttribute('placeholder') || hit.getAttribute('title') || '';
+  if (!label && tag === 'input' && ['submit', 'button'].includes((hit.type || '').toLowerCase())) label = hit.value || '';
+  if (!label && !['input', 'textarea', 'select'].includes(tag)) label = hit.innerText || hit.getAttribute('alt') || '';
+  if (!label) label = hit.getAttribute('name') || '';
+  label = label.replace(/\\s+/g, ' ').trim().slice(0, 80);
+  return {kind, label, secret: tag === 'input' && (hit.type || '').toLowerCase() === 'password'};
+}
+"""
+
+KEYS = {"Enter", "Tab", "Backspace", "Escape", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "PageDown", "PageUp", "Space"}
+
+
+def light(p, did=None):
+    """The page for a person watching: where it is and a fresh screenshot."""
+    state["shot"] += 1
+    shot = f"/shots/{os.getpid()}-{state['shot']}.jpg"
+    try:
+        p.screenshot(path=shot, type="jpeg", quality=60)
+    except Exception:
+        shot = None
+    try:
+        title = p.title()
+    except Exception:
+        title = ""
+    return {"ok": True, "url": p.url, "title": title, "shot": shot, "did": did}
 
 
 def page():
@@ -167,6 +215,36 @@ def handle(cmd):
         return view(p)
     if do == "state":
         return view(p)
+    if do == "shot":
+        return light(p)
+    if do == "tap":
+        vp = p.viewport_size or {"width": 1280, "height": 900}
+        x = min(max(float(cmd.get("x", 0)), 0.0), 1.0) * vp["width"]
+        y = min(max(float(cmd.get("y", 0)), 0.0), 1.0) * vp["height"]
+        did = p.evaluate(DESCRIBE, [x, y])
+        p.mouse.click(x, y)
+        settle(p)
+        return light(p, did)
+    if do == "text":
+        did = p.evaluate(DESCRIBE, None)
+        p.keyboard.type(str(cmd.get("text", ""))[:2000], delay=15)
+        time.sleep(0.3)
+        return light(p, did)
+    if do == "key":
+        key = str(cmd.get("key", ""))
+        if key not in KEYS:
+            return {"ok": False, "error": f"Unknown key {key!r}."}
+        did = p.evaluate(DESCRIBE, None)
+        p.keyboard.press(" " if key == "Space" else key)
+        if key == "Enter":
+            settle(p)
+        else:
+            time.sleep(0.3)
+        return light(p, did)
+    if do in ("open_light", "scroll_light", "back_light"):
+        inner = dict(cmd, do=do[:-6])
+        out = handle(inner)
+        return light(p) if out.get("ok") else out
     return {"ok": False, "error": f"Unknown browser command {do!r}."}
 
 
